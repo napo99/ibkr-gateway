@@ -43,12 +43,13 @@ config.yaml
 logs/
 *.log.*
 
-# IDE
+# IDE & Config
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.claude/
 
 # OS
 .DS_Store
