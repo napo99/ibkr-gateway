@@ -1,8 +1,9 @@
 # 📊 BTC vs ES Futures Correlation Analysis - Project Plan
 
-**Status**: 🟡 Planning Phase
+**Status**: 🟢 V1 Complete - Live Dashboard Running
 **Created**: 2025-12-01
 **Last Updated**: 2025-12-01
+**Git User**: napo99 (miguel_ddvv@hotmail.com)
 
 ---
 
@@ -413,23 +414,136 @@ error_handling:
 
 ---
 
-## 📈 Future Enhancements (Post-MVP)
+## ✅ V1 Implementation Completed (2025-12-01)
 
-### Phase 7+: Advanced Features
-- [ ] Real-time streaming (WebSocket for both sources)
-- [ ] Statistical correlation analysis
-  - Rolling correlation coefficient
-  - Lead/lag analysis (does ES lead BTC or vice versa?)
-  - Correlation breakdown by time of day
-- [ ] Alert system
-  - Notify when correlation breaks down
-  - Divergence detection
-- [ ] Multiple timeframe analysis (1m, 5m, 1h simultaneously)
-- [ ] Additional assets (ETH, NQ futures, Gold futures)
-- [ ] Backtesting framework
-- [ ] Live dashboard (auto-refresh every minute)
-- [ ] Database storage (PostgreSQL/InfluxDB for timeseries)
-- [ ] Cloud deployment (AWS/GCP)
+### What Was Built:
+- **Live WebSocket Server** (`src/live_server.py`) - Real-time dashboard served via aiohttp
+- **Data Sources** (`src/data_sources.py`) - IBKR + Binance clients with streaming
+- **Analysis Module** (`src/analysis.py`) - Correlation calculations, lead/lag analysis
+- **Dashboard Generator** (`src/dashboard.py`) - Static HTML generation (superseded by live server)
+
+### Key Changes from Original Plan:
+1. **WebSocket-based live updates** instead of static HTML refresh
+   - BTC ticks: 20ms throttle (50 updates/sec)
+   - ES ticks: 50ms throttle (20 updates/sec)
+   - Real-time price sync across all chart timeframes
+
+2. **24-hour backfill** for real-time charts (was originally 30 mins)
+
+3. **Tick-level updates** - Charts update with every tick, not just completed candles
+
+4. **Synchronized crosshairs** between paired charts (ES/BTC real-time, ES/BTC historical)
+
+5. **Measurement tooltip** - Shows price/time/% move when hovering
+
+6. **Visual correlation overlay chart** - Shows both assets on same chart with % change normalization
+
+### Current Limitations Identified:
+1. **% Change overlay is misleading** - Shows absolute performance, not actual correlation relationship
+2. **Scale mismatch** - ES appears flat because moves are proportionally smaller than BTC
+3. **No rolling correlation metric** - Can't see when correlation strengthens/weakens over time
+4. **Header vs chart price divergence** - Fixed, but was a UX issue
+
+---
+
+## 📈 V2 Enhancement Ideas (Future Iterations)
+
+### Better Correlation Visualizations
+
+#### 1. Rolling Correlation Line Chart
+- Show correlation coefficient over time (e.g., 1-hour rolling window)
+- Y-axis: -1 to +1
+- Color gradient: Green (+1) → Yellow (0) → Red (-1)
+- **Best for**: Seeing when correlation breaks down (trading opportunity)
+
+#### 2. Correlation Heatmap (Time x Timeframe)
+- X-axis: Time of day (00:00 to 23:59)
+- Y-axis: Different timeframes (1m, 5m, 15m, 1h, 4h)
+- Color intensity: Correlation strength
+- **Best for**: Finding optimal trading windows
+
+#### 3. Scatter Plot (ES Returns vs BTC Returns)
+- X-axis: ES bar-by-bar returns
+- Y-axis: BTC bar-by-bar returns
+- Tight diagonal line = high correlation
+- Scattered points = low correlation
+- Add regression line with R² value
+- **Best for**: Statistical validation of relationship
+
+#### 4. Spread/Ratio Chart
+- Plot ES/BTC ratio (normalized) over time
+- Mean-reversion bands (Bollinger-style)
+- When spread deviates > 2 std, highlight as divergence signal
+- **Best for**: Pairs trading signals
+
+#### 5. TradingView-Style Overlay (Like User's Screenshot)
+- BTC candles as primary
+- ES as line overlay on secondary axis
+- Both Y-axes visible (BTC price right, ES price left)
+- Volume histogram at bottom
+- **Best for**: Direct visual comparison
+
+#### 6. Lead/Lag Indicator
+- Visual indicator showing which asset is leading
+- Arrow direction: → ES leads, ← BTC leads
+- Lag time in minutes
+- Confidence level based on cross-correlation strength
+
+#### 7. Divergence Alert Panel
+- Real-time detection when assets decouple
+- Severity levels: Minor (yellow), Major (red)
+- Duration of divergence
+- Historical divergence count
+
+### Technical Improvements
+
+#### Data & Performance
+- [ ] Add 3-day, 7-day, 30-day historical data fetch options
+- [ ] Database persistence (SQLite or InfluxDB)
+- [ ] Data gap detection and alerting
+- [ ] Reduce WebSocket message size (binary protocol)
+
+#### UX Improvements
+- [ ] Timeframe selector dropdown (1m, 5m, 15m, 1h, 4h, 1D)
+- [ ] Dark/Light theme toggle
+- [ ] Fullscreen mode for individual charts
+- [ ] Export data to CSV
+- [ ] Screenshot/share functionality
+
+#### Additional Assets
+- [ ] NQ (Nasdaq futures) vs BTC
+- [ ] Gold (GC) vs BTC
+- [ ] ETH vs ES
+- [ ] Multi-asset correlation matrix
+
+#### Alerts & Notifications
+- [ ] Browser notifications on divergence
+- [ ] Discord/Telegram webhook integration
+- [ ] Email alerts for significant correlation changes
+- [ ] Sound alerts for divergence events
+
+#### Analytics
+- [ ] Correlation breakdown by session (Asia/Europe/US)
+- [ ] Volatility-adjusted correlation
+- [ ] Granger causality test (who leads statistically?)
+- [ ] Correlation regime detection (clustering)
+
+---
+
+## 📊 Correlation Display Comparison
+
+| Visualization | Shows | Best For | Complexity |
+|--------------|-------|----------|------------|
+| % Change Overlay (current) | Absolute performance | Price comparison | Low |
+| Rolling Correlation Line | Correlation over time | Timing trades | Medium |
+| Heatmap | Time-of-day patterns | Session analysis | Medium |
+| Scatter Plot | Statistical relationship | Validation | Medium |
+| Spread Chart | Mean reversion | Pairs trading | Medium |
+| TradingView Overlay | Direct price comparison | Visual analysis | Low |
+
+**Recommendation for V2**: Implement Rolling Correlation Line + TradingView-style overlay as priority enhancements.
+
+---
 
 ---
 

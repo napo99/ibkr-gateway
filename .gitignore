@@ -71,3 +71,15 @@ data/
 # Temporary files
 *.tmp
 *.temp
+
+# Virtual environment (UV)
+.venv/
+
+# Output directory (regenerated at runtime)
+output/
+
+# Downloaded JS libraries
+lightweight-charts.standalone.production.js
+
+# Windows null device file
+nul
