@@ -380,6 +380,13 @@ class LiveDashboardServer:
             return web.FileResponse(html_path)
         return web.Response(text="Dashboard not found", status=404)
 
+    async def micro_handler(self, request):
+        """Serve the micro-view dashboard HTML"""
+        html_path = Path(__file__).parent.parent / 'output' / 'micro_dashboard.html'
+        if html_path.exists():
+            return web.FileResponse(html_path)
+        return web.Response(text="Micro dashboard not found", status=404)
+
     def _run_ibkr_stream(self):
         """Run IBKR stream in thread"""
         self.ibkr.stream()
@@ -479,10 +486,13 @@ class LiveDashboardServer:
 
         # Generate the live dashboard HTML
         self._generate_live_html()
+        # Also generate micro-view (real-time focus) and overview (current) pages
+        self._generate_micro_html()
 
         # Setup web server
         app = web.Application()
         app.router.add_get('/', self.index_handler)
+        app.router.add_get('/micro', self.micro_handler)
         app.router.add_get('/ws', self.websocket_handler)
         app.router.add_get('/reload-token', self.reload_token_handler)
 
@@ -2468,6 +2478,56 @@ class LiveDashboardServer:
             f.write(html)
 
         print(f"[OK] Generated live dashboard")
+
+    def _generate_micro_html(self):
+        """Generate a slim microstructure-focused dashboard (no historical panes)."""
+        # For now, reuse the main layout but hide historical and correlation sections via CSS.
+        # This keeps a single HTML template path; we just toggle visibility for micro view.
+        reload_token = self._load_reload_token() or str(int(time.time()))
+        html = '''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ES/BTC Micro View</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        /* Hide historical/correlation sections for micro view */
+        .charts-container.historical-section,
+        .correlation-overlay-section {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <div id="micro-root">Loading micro view...</div>
+    <script>
+        // Simple redirect to main JS but with a flag that hides historical/correlation.
+        // Because the main HTML builds inline, we replicate the main generation here by loading the already-built file.
+        fetch('/').then(r => r.text()).then(html => {
+            // Replace the body with the main HTML, then hide sections via CSS classes.
+            document.open();
+            document.write(html);
+            document.close();
+            // Mark historical and correlation sections to be hidden.
+            const histSections = document.querySelectorAll('.charts-container');
+            histSections.forEach((el, idx) => {
+                // Hide the second row (historical) if present
+                if (idx > 0) el.style.display = 'none';
+            });
+            const overlaySection = document.querySelector('.correlation-overlay-section');
+            if (overlaySection) overlaySection.style.display = 'none';
+        });
+    </script>
+</body>
+</html>'''
+
+        output_dir = Path(__file__).parent.parent / 'output'
+        output_dir.mkdir(exist_ok=True)
+
+        with open(output_dir / 'micro_dashboard.html', 'w', encoding='utf-8') as f:
+            f.write(html)
+
+        print(f"[OK] Generated micro dashboard")
 
 
 async def main():

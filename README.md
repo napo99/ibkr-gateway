@@ -31,7 +31,9 @@ uv run python src/live_server.py
 # or with auto-restart + auto-reload
 python dev_watch.py
 ```
-Open `http://127.0.0.1:8765` in the browser.
+Open in the browser:
+- Overview (with historical/overlay): `http://127.0.0.1:8765`
+- Micro view (real-time focus): `http://127.0.0.1:8765/micro`
 
 ## IBKR Gateway Setup
 1. Run IB Gateway/TWS.
