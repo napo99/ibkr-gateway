@@ -1911,9 +1911,15 @@ class LiveDashboardServer:
 
                 if (start.time == null) return;
 
-                // Coordinates
-                const x1 = start.x;
-                const y1 = start.y;
+                // Coordinates - re-convert from time/price each frame to handle live scale shifts
+                // This fixes the "drift" bug on overlay where stored pixels become stale
+                let x1 = chart.timeScale().timeToCoordinate(start.time);
+                let y1 = start.series && typeof start.series.priceToCoordinate === 'function'
+                    ? start.series.priceToCoordinate(start.price)
+                    : start.y;
+                // Fallback to stored pixels if conversion fails
+                if (x1 == null || !isFinite(x1)) x1 = start.x;
+                if (y1 == null || !isFinite(y1)) y1 = start.y;
                 const x2 = point.x;
                 const y2 = point.y;
                 if ([x1, y1, x2, y2].some(v => v == null || !isFinite(v))) return;
