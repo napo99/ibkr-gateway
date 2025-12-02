@@ -486,7 +486,7 @@ class LiveDashboardServer:
 
         # Generate the live dashboard HTML
         self._generate_live_html()
-        # Also generate micro-view (real-time focus) and overview (current) pages
+        # Generate the micro view (realtime + overlay, no historical panes)
         self._generate_micro_html()
 
         # Setup web server
@@ -2480,42 +2480,29 @@ class LiveDashboardServer:
         print(f"[OK] Generated live dashboard")
 
     def _generate_micro_html(self):
-        """Generate a slim microstructure-focused dashboard (no historical panes)."""
-        # For now, reuse the main layout but hide historical and correlation sections via CSS.
-        # This keeps a single HTML template path; we just toggle visibility for micro view.
-        reload_token = self._load_reload_token() or str(int(time.time()))
+        """Generate a slim microstructure-focused dashboard (hide historical panes)."""
+        # Reuse the main HTML and hide historical sections when loaded.
         html = '''<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <title>ES/BTC Micro View</title>
     <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
-    <style>
-        /* Hide historical/correlation sections for micro view */
-        .charts-container.historical-section,
-        .correlation-overlay-section {
-            display: none !important;
-        }
-    </style>
 </head>
 <body>
     <div id="micro-root">Loading micro view...</div>
     <script>
-        // Simple redirect to main JS but with a flag that hides historical/correlation.
-        // Because the main HTML builds inline, we replicate the main generation here by loading the already-built file.
+        // Load the main dashboard HTML, then hide historical panes.
         fetch('/').then(r => r.text()).then(html => {
-            // Replace the body with the main HTML, then hide sections via CSS classes.
             document.open();
             document.write(html);
             document.close();
-            // Mark historical and correlation sections to be hidden.
-            const histSections = document.querySelectorAll('.charts-container');
-            histSections.forEach((el, idx) => {
-                // Hide the second row (historical) if present
+            // Hide second charts-container row (historical) if present.
+            const grids = document.querySelectorAll('.charts-container');
+            grids.forEach((el, idx) => {
                 if (idx > 0) el.style.display = 'none';
             });
-            const overlaySection = document.querySelector('.correlation-overlay-section');
-            if (overlaySection) overlaySection.style.display = 'none';
+            // Keep correlation overlay visible.
         });
     </script>
 </body>
@@ -2528,7 +2515,6 @@ class LiveDashboardServer:
             f.write(html)
 
         print(f"[OK] Generated micro dashboard")
-
 
 async def main():
     server = LiveDashboardServer()
