@@ -1850,14 +1850,34 @@ class LiveDashboardServer:
                 let targetSeries = series;
                 let seriesLabel = '';
 
+                // For overlay: choose nearest series at the click time (not last value)
                 if (chart === overlayChart && overlayEsSeries && overlayBtcSeries) {
-                    // Choose nearest series by vertical distance
-                    const esVal = overlayEsData && overlayEsData.length ? overlayEsData[overlayEsData.length - 1].value : null;
-                    const btcVal = overlayBtcData && overlayBtcData.length ? overlayBtcData[overlayBtcData.length - 1].close : null;
-                    const esY = (esVal != null && overlayEsSeries.priceToCoordinate) ? overlayEsSeries.priceToCoordinate(esVal) : null;
-                    const btcY = (btcVal != null && overlayBtcSeries.priceToCoordinate) ? overlayBtcSeries.priceToCoordinate(btcVal) : null;
+                    const clickTime = chart.timeScale().coordinateToTime(point.x);
+                    if (clickTime == null) return { targetSeries, seriesLabel };
+
+                    // Find nearest data points at/around the click time
+                    function nearestData(dataArr, t) {
+                        if (!dataArr || dataArr.length === 0) return null;
+                        // binary search for nearest time
+                        let l = 0, r = dataArr.length - 1;
+                        while (l < r) {
+                            const m = Math.floor((l + r) / 2);
+                            if (dataArr[m].time < t) l = m + 1; else r = m;
+                        }
+                        const cand = dataArr[l];
+                        const prev = l > 0 ? dataArr[l - 1] : null;
+                        if (prev && Math.abs(prev.time - t) < Math.abs(cand.time - t)) return prev;
+                        return cand;
+                    }
+
+                    const esPoint = nearestData(overlayEsData, clickTime);
+                    const btcPoint = nearestData(overlayBtcData, clickTime);
+
+                    const esY = esPoint && overlayEsSeries.priceToCoordinate ? overlayEsSeries.priceToCoordinate(esPoint.value) : null;
+                    const btcY = btcPoint && overlayBtcSeries.priceToCoordinate ? overlayBtcSeries.priceToCoordinate(btcPoint.close || btcPoint.value || btcPoint.price) : null;
                     const dyEs = esY != null && point?.y != null ? Math.abs(point.y - esY) : Number.POSITIVE_INFINITY;
                     const dyBtc = btcY != null && point?.y != null ? Math.abs(point.y - btcY) : Number.POSITIVE_INFINITY;
+
                     if (dyEs < dyBtc) {
                         targetSeries = overlayEsSeries;
                         seriesLabel = 'ES %';
