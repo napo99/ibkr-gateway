@@ -1,5 +1,6 @@
 """
 Correlation and Lead/Lag Analysis
+Improved with dynamic lag detection and significance testing
 """
 
 import numpy as np
@@ -62,8 +63,8 @@ def calculate_correlation(es_prices: np.ndarray, btc_prices: np.ndarray) -> Corr
     btc = btc_prices[-min_len:]
 
     # Calculate returns
-    es_returns = np.diff(es) / es[:-1]
-    btc_returns = np.diff(btc) / btc[:-1]
+    es_returns = np.diff(es) / (es[:-1] + 1e-10)
+    btc_returns = np.diff(btc) / (btc[:-1] + 1e-10)
 
     # Remove NaN/Inf
     mask = np.isfinite(es_returns) & np.isfinite(btc_returns)
@@ -75,6 +76,11 @@ def calculate_correlation(es_prices: np.ndarray, btc_prices: np.ndarray) -> Corr
 
     # Pearson correlation
     corr, p_value = stats.pearsonr(es_returns, btc_returns)
+
+    # Handle NaN correlation
+    if not np.isfinite(corr):
+        corr = 0
+        p_value = 1
 
     # Determine strength
     abs_corr = abs(corr)
@@ -100,38 +106,78 @@ def calculate_correlation(es_prices: np.ndarray, btc_prices: np.ndarray) -> Corr
 
 
 def calculate_lead_lag(es_returns: np.ndarray, btc_returns: np.ndarray,
-                       max_lag: int = 10) -> Tuple[int, float]:
+                       max_lag: int = None) -> Tuple[int, float]:
     """
     Calculate lead/lag relationship using cross-correlation
+
+    Improved with:
+    - Dynamic max_lag based on data length
+    - Significance threshold for meaningful results
+    - Better edge case handling
 
     Returns:
         (lag, correlation) where:
         - Positive lag = ES leads BTC by N periods
         - Negative lag = BTC leads ES by N periods
+        - 0 = synchronized or no significant lead/lag
     """
-    if len(es_returns) < max_lag * 2:
+    n = len(es_returns)
+
+    # Dynamic max_lag: check up to 10% of data or 30 periods, whichever is smaller
+    if max_lag is None:
+        max_lag = min(max(n // 10, 5), 30)
+
+    if n < max_lag * 2 + 1:
         return 0, 0.0
 
-    # Normalize
-    es_norm = (es_returns - np.mean(es_returns)) / (np.std(es_returns) + 1e-10)
-    btc_norm = (btc_returns - np.mean(btc_returns)) / (np.std(btc_returns) + 1e-10)
+    # Normalize to zero mean, unit variance
+    es_std = np.std(es_returns)
+    btc_std = np.std(btc_returns)
+
+    if es_std < 1e-10 or btc_std < 1e-10:
+        return 0, 0.0
+
+    es_norm = (es_returns - np.mean(es_returns)) / es_std
+    btc_norm = (btc_returns - np.mean(btc_returns)) / btc_std
 
     # Cross-correlation at different lags
     correlations = []
     for lag in range(-max_lag, max_lag + 1):
         if lag < 0:
-            # BTC leads: compare BTC[:-lag] with ES[-lag:]
-            corr = np.corrcoef(btc_norm[:lag], es_norm[-lag:])[0, 1]
+            # BTC leads: compare BTC[:-|lag|] with ES[|lag|:]
+            abs_lag = abs(lag)
+            if abs_lag >= len(btc_norm):
+                continue
+            corr_val = np.corrcoef(btc_norm[:-abs_lag], es_norm[abs_lag:])[0, 1]
         elif lag > 0:
             # ES leads: compare ES[:-lag] with BTC[lag:]
-            corr = np.corrcoef(es_norm[:-lag], btc_norm[lag:])[0, 1]
+            if lag >= len(es_norm):
+                continue
+            corr_val = np.corrcoef(es_norm[:-lag], btc_norm[lag:])[0, 1]
         else:
-            corr = np.corrcoef(es_norm, btc_norm)[0, 1]
+            # Synchronous
+            corr_val = np.corrcoef(es_norm, btc_norm)[0, 1]
 
-        correlations.append((lag, corr if np.isfinite(corr) else 0))
+        if np.isfinite(corr_val):
+            correlations.append((lag, corr_val))
 
-    # Find max correlation
+    if not correlations:
+        return 0, 0.0
+
+    # Find max absolute correlation
     best_lag, best_corr = max(correlations, key=lambda x: abs(x[1]))
+
+    # Significance threshold: only report lead/lag if correlation at that lag
+    # is significantly stronger than at lag 0
+    sync_corr = next((c for l, c in correlations if l == 0), 0)
+
+    # If the best correlation isn't meaningfully better than sync, report sync
+    SIGNIFICANCE_THRESHOLD = 0.05  # 5% better correlation required
+    if abs(best_corr) < 0.2:  # Correlation too weak to be meaningful
+        return 0, sync_corr
+    if abs(best_corr) - abs(sync_corr) < SIGNIFICANCE_THRESHOLD:
+        return 0, sync_corr
+
     return best_lag, best_corr
 
 
@@ -139,8 +185,11 @@ def normalize_prices(es_prices: np.ndarray, btc_prices: np.ndarray) -> Tuple[np.
     """
     Normalize prices to 0-1 range for overlay comparison
     """
-    es_norm = (es_prices - np.min(es_prices)) / (np.max(es_prices) - np.min(es_prices) + 1e-10)
-    btc_norm = (btc_prices - np.min(btc_prices)) / (np.max(btc_prices) - np.min(btc_prices) + 1e-10)
+    es_range = np.max(es_prices) - np.min(es_prices)
+    btc_range = np.max(btc_prices) - np.min(btc_prices)
+
+    es_norm = (es_prices - np.min(es_prices)) / (es_range + 1e-10)
+    btc_norm = (btc_prices - np.min(btc_prices)) / (btc_range + 1e-10)
     return es_norm, btc_norm
 
 
@@ -160,14 +209,17 @@ def calculate_divergence(es_prices: np.ndarray, btc_prices: np.ndarray,
     btc = btc_prices[-min_len:]
 
     # Returns
-    es_ret = np.diff(es) / es[:-1]
-    btc_ret = np.diff(btc) / btc[:-1]
+    es_ret = np.diff(es) / (es[:-1] + 1e-10)
+    btc_ret = np.diff(btc) / (btc[:-1] + 1e-10)
 
     # Rolling correlation
     divergence = np.zeros(len(es_ret) - window + 1)
     for i in range(len(divergence)):
         corr = np.corrcoef(es_ret[i:i+window], btc_ret[i:i+window])[0, 1]
-        divergence[i] = max(0, -corr)  # 0 when correlated, up to 1 when anti-correlated
+        if np.isfinite(corr):
+            divergence[i] = max(0, -corr)  # 0 when correlated, up to 1 when anti-correlated
+        else:
+            divergence[i] = 0
 
     return divergence
 
@@ -184,25 +236,40 @@ class MultiTimeframeAnalysis:
 
     def __init__(self, es_df: pd.DataFrame, btc_df: pd.DataFrame):
         """
-        Initialize with aligned DataFrames
+        Initialize with DataFrames
         Both must have 'timestamp' and 'close' columns
         """
         self.es_df = es_df.copy()
         self.btc_df = btc_df.copy()
+
+        # Ensure timestamp is datetime (convert tz-aware to UTC for compatibility)
+        if 'timestamp' in self.es_df.columns and not pd.api.types.is_datetime64_any_dtype(self.es_df['timestamp']):
+            self.es_df['timestamp'] = pd.to_datetime(self.es_df['timestamp'], utc=True)
+        if 'timestamp' in self.btc_df.columns and not pd.api.types.is_datetime64_any_dtype(self.btc_df['timestamp']):
+            self.btc_df['timestamp'] = pd.to_datetime(self.btc_df['timestamp'], utc=True)
 
     def resample(self, df: pd.DataFrame, minutes: int) -> pd.DataFrame:
         """Resample to higher timeframe"""
         if minutes == 1:
             return df
 
+        if 'timestamp' not in df.columns or len(df) == 0:
+            return pd.DataFrame()
+
         df = df.set_index('timestamp')
-        resampled = df.resample(f'{minutes}min').agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }).dropna().reset_index()
+
+        # Resample OHLCV properly
+        agg_dict = {'close': 'last'}
+        if 'open' in df.columns:
+            agg_dict['open'] = 'first'
+        if 'high' in df.columns:
+            agg_dict['high'] = 'max'
+        if 'low' in df.columns:
+            agg_dict['low'] = 'min'
+        if 'volume' in df.columns:
+            agg_dict['volume'] = 'sum'
+
+        resampled = df.resample(f'{minutes}min').agg(agg_dict).dropna().reset_index()
         return resampled
 
     def analyze_all(self) -> dict:
@@ -210,30 +277,35 @@ class MultiTimeframeAnalysis:
         results = {}
 
         for tf_name, minutes in self.TIMEFRAMES.items():
-            es_resampled = self.resample(self.es_df, minutes)
-            btc_resampled = self.resample(self.btc_df, minutes)
+            try:
+                es_resampled = self.resample(self.es_df, minutes)
+                btc_resampled = self.resample(self.btc_df, minutes)
 
-            if len(es_resampled) < 10 or len(btc_resampled) < 10:
+                if len(es_resampled) < 10 or len(btc_resampled) < 10:
+                    results[tf_name] = CorrelationResult(0, 1, 0, 0, 'none').to_dict()
+                    continue
+
+                # Align by timestamp
+                merged = pd.merge(
+                    es_resampled[['timestamp', 'close']].rename(columns={'close': 'es_close'}),
+                    btc_resampled[['timestamp', 'close']].rename(columns={'close': 'btc_close'}),
+                    on='timestamp',
+                    how='inner'
+                )
+
+                if len(merged) < 10:
+                    results[tf_name] = CorrelationResult(0, 1, 0, 0, 'none').to_dict()
+                    continue
+
+                result = calculate_correlation(
+                    merged['es_close'].values,
+                    merged['btc_close'].values
+                )
+                results[tf_name] = result.to_dict()
+
+            except Exception as e:
+                print(f"[ANALYSIS] Error calculating {tf_name} correlation: {e}")
                 results[tf_name] = CorrelationResult(0, 1, 0, 0, 'none').to_dict()
-                continue
-
-            # Align by timestamp
-            merged = pd.merge(
-                es_resampled[['timestamp', 'close']].rename(columns={'close': 'es_close'}),
-                btc_resampled[['timestamp', 'close']].rename(columns={'close': 'btc_close'}),
-                on='timestamp',
-                how='inner'
-            )
-
-            if len(merged) < 10:
-                results[tf_name] = CorrelationResult(0, 1, 0, 0, 'none').to_dict()
-                continue
-
-            result = calculate_correlation(
-                merged['es_close'].values,
-                merged['btc_close'].values
-            )
-            results[tf_name] = result.to_dict()
 
         return results
 

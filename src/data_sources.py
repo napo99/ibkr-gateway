@@ -79,15 +79,56 @@ class BinanceClient:
         self._running = False
         self._ws = None
 
+    def _interval_ms(self, interval: str) -> int:
+        """Convert Binance interval string to milliseconds (supports m/h)."""
+        if interval.endswith('m'):
+            return int(interval[:-1]) * 60_000
+        if interval.endswith('h'):
+            return int(interval[:-1]) * 3_600_000
+        raise ValueError(f"Unsupported interval: {interval}")
+
     async def fetch_historical(self, interval: str = '1h', limit: int = 168) -> pd.DataFrame:
-        """Fetch historical klines (default: 7 days of hourly data)"""
-        params = {'symbol': 'BTCUSDT', 'interval': interval, 'limit': limit}
+        """Fetch historical klines, chunking when limit > 1000 (Binance max)."""
+        max_limit = 1000  # Binance per-request cap
+        step_ms = self._interval_ms(interval)
+        all_klines = []
+
         async with aiohttp.ClientSession() as session:
-            async with session.get(self.REST_URL, params=params) as resp:
-                data = await resp.json()
+            if limit <= max_limit:
+                params = {'symbol': 'BTCUSDT', 'interval': interval, 'limit': limit}
+                async with session.get(self.REST_URL, params=params) as resp:
+                    all_klines = await resp.json()
+            else:
+                # Pull in chronological chunks using startTime to avoid overlap
+                now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                start_ms = now_ms - step_ms * limit
+                fetched = 0
+                next_start = start_ms
+                # prevent infinite loops
+                for _ in range((limit // max_limit) + 5):
+                    batch_limit = min(max_limit, limit - fetched)
+                    params = {
+                        'symbol': 'BTCUSDT',
+                        'interval': interval,
+                        'limit': batch_limit,
+                        'startTime': next_start
+                    }
+                    async with session.get(self.REST_URL, params=params) as resp:
+                        chunk = await resp.json()
+                    if not chunk:
+                        break
+                    all_klines.extend(chunk)
+                    fetched = len(all_klines)
+                    # advance start to next candle open time
+                    next_start = chunk[-1][0] + step_ms
+                    if fetched >= limit or len(chunk) < batch_limit:
+                        break
+
+        # Trim to requested limit
+        all_klines = all_klines[:limit]
 
         bars = []
-        for k in data:
+        for k in all_klines:
             bars.append(OHLCV(
                 timestamp=datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
                 open=float(k[1]),

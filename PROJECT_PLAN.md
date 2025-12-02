@@ -1,223 +1,49 @@
-# 📊 BTC vs ES Futures Correlation Analysis - Project Plan
+# BTC vs ES/NQ Correlation Dashboard — Plan (Updated)
 
-**Status**: 🟢 V1 Complete - Live Dashboard Running
-**Created**: 2025-12-01
-**Last Updated**: 2025-12-01
-**Git User**: napo99 (miguel_ddvv@hotmail.com)
+Status: V1 running (live dashboard). This doc is simplified to focus on what matters next.
 
----
+## Phase 1 (done)
+- Live BTC/ES charts with correlation overlay.
+- Basic measurement, crosshair sync, data streaming.
 
-## 🎯 Project Goals
+## Phase 2 (near-term, high-value)
 
-### Primary Objective
-Create a professional-grade market correlation tool that compares **Bitcoin (BTC)** price movements against **E-mini S&P 500 Futures (ES)** using institutional-quality data sources.
+### 1) Volume & VWAP (conviction)
+- Enlarge volume panes (20–25% height) for ES/BTC (and NQ if added).
+- Rolling 10–20 bar avg on 1m bars; fade sub-avg, brighten >avg; tag spikes >1.5–2x.
+- Add VWAP lines; optional small “VWAP↑ 1.6x” tag when crossed with >1.5x vol.
+- Header badges: `ES VOL 1.8x | NQ VOL 2.1x` (green >1.5x, yellow 1.0–1.5x, gray <1.0x).
 
-### Key Success Criteria
-1. ✅ Accurate OHLCV data at 1-minute granularity
-2. ✅ True 24/7 data coverage for both assets
-3. ✅ Professional visualization matching TradingView quality
-4. ✅ Reliable data pipeline with error handling
-5. ✅ Easy to run and maintain
+### 2) Volatility strip (context + crypto-specific)
+- DVOL (Deribit implied vol for BTC, real-time, free).
+- Short-term realized vol: RV15m vs RV60m on 1m bars; show ratio (expanding >1.5, crush <0.5).
+- Optional VIX (delayed via ^VIX/yfinance) for context only; live needs CFE subscription.
+Display example:
+`VOL: RV15 1.2% · RV60 0.7% (1.7x 🔺) · DVOL 52.1 · VIX 14.2 (delayed)`
 
----
+### 3) Add NQ alongside ES
+- NQ price/% in header + its volume badge.
+- Optional thin NQ/ES ratio line for tech leadership.
 
-## 🏗️ Architecture Design
+### 4) Divergence awareness (not a trade signal)
+- Pill: `DIV: +1.8σ (BTC>ES)` gated by corr>0.4 and RTH hours; else gray.
+- Score = (BTC % – ES/NQ %) / recent stddev; only alert on meaningful gaps.
 
-### Data Sources Strategy: **Hybrid Streaming Approach (Option 2)**
+## What to skip (for now)
+- CVD/Delta (complex, limited edge).
+- VPOC/POC (nice-to-have, not critical).
+- Alpha Vantage “free” VIX (limits too tight for real-time).
 
-| Asset | Source | API/Library | Data Type | Cost | Rationale |
-|-------|--------|-------------|-----------|------|-----------|
-| **ES Futures** | IBKR Paper Account | `ib_insync` / TWS API | **Real-time Stream** | Free (paper) → Paid when moving to live | Institutional-grade futures data, 23.75hr trading |
-| **Bitcoin** | Binance.com | Binance WebSocket API | **Real-time Stream** | Free (unlimited) | Largest crypto exchange, most accurate price discovery |
+## Implementation notes (no DB needed)
+- Volume averages: rolling 10–20 of 1m bars in memory; session avg from existing backfill if desired.
+- DVOL API: `https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC`.
+- RV: use last 15 and 60 1m returns; ratio>1.5 = expansion, <0.5 = crush.
+- VIX: use delayed ^VIX via yfinance if you want context.
 
-### Why Hybrid?
-- ✅ **Best of both worlds**: Professional ES data + Free accurate BTC data
-- ✅ **Cost-effective**: Only need IBKR subscription for ES (BTC is free from Binance)
-- ✅ **Reliability**: Two independent data sources
-- ✅ **Simplicity**: Binance API easier than IBKR crypto (no Paxos permissions)
-- ✅ **Accuracy**: Using primary price discovery venues for each asset
-
----
-
-## 📐 Technical Specifications
-
-### Data Requirements
-
-#### Timeframes Supported
-- **Primary**: 1-minute bars (OHLCV) via real-time streaming
-- **Correlation Analysis**: Multiple timeframes (1m, 5m, 15m, 1h)
-- **Future**: Daily (1d) for longer-term analysis
-
-#### Data Storage Strategy
-- **MVP**: In-memory only (no persistence)
-- **Future Decision**: Optionally store 7-30 days of historical data
-- **Streaming Priority**: Focus on live data first, caching is secondary
-
-#### Data Fields
-```python
-{
-    'timestamp': datetime,  # UTC, aligned to minute boundaries
-    'open': float,
-    'high': float,
-    'low': float,
-    'close': float,
-    'volume': float
-}
-```
-
----
-
-## 🔧 Implementation Phases
-
-### Phase 1: IBKR Streaming Setup ⏳ (Week 1)
-**Goal**: Establish real-time ES futures data stream from IBKR paper account
-
-#### Tasks:
-- [ ] **1.1**: Configure IBKR paper trading account credentials
-- [ ] **1.2**: Install IB Gateway (preferred for headless operation)
-- [ ] **1.3**: Configure API settings (port 4002 for paper Gateway)
-- [ ] **1.4**: Install `ib_insync` library
-- [ ] **1.5**: Write connection test script for Jupyter
-- [ ] **1.6**: Implement ES futures contract auto-detection (front month)
-- [ ] **1.7**: Set up real-time bar streaming (reqRealTimeBars or reqMktData)
-- [ ] **1.8**: Test receiving live 5-second ES data updates
-- [ ] **1.9**: Aggregate 5-second bars into 1-minute OHLCV candles
-- [ ] **1.10**: Implement proper logging for connection events
-
-**Success Criteria**:
-- Can connect to IBKR API from Jupyter notebook
-- Real-time ES data streaming successfully (5-sec or 1-min bars)
-- Data aggregates correctly into 1-minute OHLCV candles
-- Handles reconnection if stream disconnects
-- Clean error messages logged
-
-**Deliverable**: Jupyter notebook `01_ibkr_streaming.ipynb`
-
----
-
-### Phase 2: Binance WebSocket Streaming ⏳ (Week 1)
-**Goal**: Real-time Bitcoin streaming from Binance.com
-
-#### Tasks:
-- [ ] **2.1**: Research Binance WebSocket API (Kline/Candlestick streams)
-- [ ] **2.2**: Confirm: Binance.com (international) ✅
-- [ ] **2.3**: Confirm: BTC/USDT trading pair ✅
-- [ ] **2.4**: Install `websocket-client` or `python-binance` library
-- [ ] **2.5**: Set up WebSocket connection to btcusdt@kline_1m stream
-- [ ] **2.6**: Parse incoming 1-minute candlestick data
-- [ ] **2.7**: Implement reconnection logic for dropped connections
-- [ ] **2.8**: Test WebSocket stability (run for 1+ hour)
-- [ ] **2.9**: Implement timestamp synchronization with IBKR data (UTC alignment)
-- [ ] **2.10**: Add proper logging for WebSocket events
-
-**Success Criteria**:
-- WebSocket connects and receives real-time BTC/USDT 1m candles
-- Timestamps align with IBKR data (same UTC minute boundaries)
-- Auto-reconnects on connection loss
-- Data validated against Binance web UI / TradingView
-- Clean error logging
-
-**Deliverable**: Jupyter notebook `02_binance_streaming.ipynb`
-
----
-
-### Phase 3: Unified Streaming Pipeline ⏳ (Week 2)
-**Goal**: Combine both real-time streams into synchronized data structure
-
-#### Tasks:
-- [ ] **3.1**: Design in-memory data structure (dual pandas DataFrames)
-  - ES DataFrame: timestamp, O, H, L, C, V
-  - BTC DataFrame: timestamp, O, H, L, C, V
-- [ ] **3.2**: Implement dual-stream manager class
-  - Manages both IBKR and Binance connections
-  - Aggregates incoming ticks into 1-minute candles
-- [ ] **3.3**: Timestamp synchronization
-  - Align both streams to same UTC minute boundaries
-  - Handle clock drift between sources
-- [ ] **3.4**: Data validation in real-time
-  - Flag gaps in data stream
-  - Detect anomalies (flat candles, extreme price moves)
-  - Volume sanity checks
-- [ ] **3.5**: Error handling (NO fallbacks, clean failures)
-  - IBKR disconnect → log error, attempt reconnect
-  - Binance disconnect → log error, attempt reconnect
-  - Both down → stop and alert user
-  - Implement circuit breaker pattern
-- [ ] **3.6**: Logging infrastructure
-  - Structured logging (timestamp, level, source, message)
-  - Separate log files for ES and BTC streams
-  - Summary statistics logged every 5 minutes
-
-**Success Criteria**:
-- Both streams running simultaneously in Jupyter
-- Data synchronized to same minute boundaries
-- Handles disconnections gracefully (auto-reconnect)
-- Comprehensive logging visible in notebook
-- No fallback to unreliable sources
-
-**Deliverable**: Jupyter notebook `03_unified_streaming.ipynb`
-
----
-
-### Phase 4: Live Visualization + Correlation ⏳ (Week 2-3)
-**Goal**: Real-time charts with correlation analysis across multiple timeframes
-
-#### Current Design to Keep (from Gemini):
-- ✅ TradingView Lightweight Charts library
-- ✅ Synchronized dual-chart layout (BTC top, ES bottom)
-- ✅ Dark theme (#131722 background)
-- ✅ Zoom/pan synchronization
-- ✅ Crosshair synchronization
-
-#### New Features to Add:
-- [ ] **4.1**: Update to streaming data instead of static HTML
-  - Chart updates in real-time as new 1m candles arrive
-  - Auto-scroll to keep latest data visible
-- [ ] **4.2**: Update chart labels
-  - "ES Futures (CME via IBKR Paper)"
-  - "BTC/USDT (Binance.com)"
-- [ ] **4.3**: **Multi-timeframe correlation analysis** (CORE FEATURE)
-  - Calculate rolling correlation for 1m, 5m, 15m, 1h windows
-  - Display correlation coefficient panel below charts
-  - Color-coded: Green (>0.5), Yellow (0-0.5), Red (<0)
-  - Update correlation in real-time
-- [ ] **4.4**: Add volume bars below each price chart
-- [ ] **4.5**: Correlation divergence alerts
-  - Detect when correlation breaks down significantly
-  - Visual indicator when correlation < 0.2 (unusual)
-- [ ] **4.6**: Timestamp display
-  - Show UTC time
-  - Format: "2025-12-01 14:35:00 UTC"
-  - Display last update time
-
-#### Live Chart Implementation:
-- [ ] **4.7**: Implement auto-refresh mechanism
-  - Update chart every 60 seconds (new 1m candle)
-  - Use IPython display for Jupyter updates
-- [ ] **4.8**: Chart performance optimization
-  - Limit visible data to last 500 candles
-  - Keep full dataset in memory for correlation calc
-
-**Success Criteria**:
-- Charts update automatically with live data
-- Correlation calculated across 4 timeframes (1m, 5m, 15m, 1h)
-- Visual quality matches Gemini's design
-- All interactive features work (zoom, pan, crosshair)
-- Correlation panel updates every minute
-
-**Deliverable**: Jupyter notebook `04_live_visualization.ipynb`
-
----
-
-### Phase 5: Testing & Validation ⏳ (Week 3)
-**Goal**: Ensure reliability and accuracy
-
-#### Test Scenarios:
-- [ ] **5.1**: Normal operation (both APIs working)
-- [ ] **5.2**: IBKR connection failure
-  - Test fallback behavior (error message or retry)
-- [ ] **5.3**: Binance API failure
-  - Test fallback (try backup exchange?)
+## Fast path to ship
+1) Volume panes + VWAP + spike tagging + header volume badges.
+2) Volatility strip with DVOL + RV15/60 ratio (optionally delayed VIX).
+3) Add NQ feed + header entry; optional NQ/ES ratio line.
 - [ ] **5.4**: Data quality validation
   - Compare ES prices with TradingView ES1!
   - Compare BTC prices with CoinMarketCap

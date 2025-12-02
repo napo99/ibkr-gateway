@@ -7,7 +7,9 @@ WITH correlation analysis and lead/lag detection
 import asyncio
 import os
 from datetime import datetime, timezone, timedelta
+import math
 from pathlib import Path
+import time
 from aiohttp import web
 import aiohttp
 import pandas as pd
@@ -79,6 +81,42 @@ class LiveDashboardServer:
         self._tick_queue = []
         self._tick_flush_task = None
 
+    @staticmethod
+    def _is_valid_price(value) -> bool:
+        return isinstance(value, (int, float)) and math.isfinite(value)
+
+    def _bar_to_dict(self, bar: OHLCV) -> dict | None:
+        """Safely convert bar to payload or None if invalid"""
+        if not bar:
+            return None
+        if not all([
+            self._is_valid_price(bar.open),
+            self._is_valid_price(bar.high),
+            self._is_valid_price(bar.low),
+            self._is_valid_price(bar.close),
+            self._is_valid_price(bar.volume),
+        ]):
+            return None
+        return {
+            'time': int(self._align_timestamp(bar.timestamp).timestamp()),
+            'open': float(bar.open),
+            'high': float(bar.high),
+            'low': float(bar.low),
+            'close': float(bar.close),
+            'volume': float(bar.volume),
+        }
+
+    def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Remove non-finite rows before serialization"""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        numeric_cols = [c for c in ['open', 'high', 'low', 'close', 'volume'] if c in df.columns]
+        for col in numeric_cols:
+            df = df[pd.to_numeric(df[col], errors='coerce').apply(math.isfinite)]
+        df = df.dropna(subset=['timestamp'] + numeric_cols)
+        return df
+
     async def _broadcast(self, data: dict):
         """Send data to all connected clients (optimized)"""
         if not self.clients:
@@ -94,6 +132,8 @@ class LiveDashboardServer:
 
     def _queue_tick(self, symbol: str, price: float, ts: int):
         """Queue a tick for batched broadcast (reduces overhead)"""
+        if not self._is_valid_price(price):
+            return
         self._tick_queue.append({'s': symbol, 'p': price, 't': ts})
 
         # Start flush task if not running
@@ -116,6 +156,10 @@ class LiveDashboardServer:
 
     def _on_es_bar(self, bar: OHLCV):
         """Callback when new ES bar completes"""
+        payload = self._bar_to_dict(bar)
+        if payload is None:
+            print("[ES] Skipping invalid bar")
+            return
         self.latest_es_bar = bar
         aligned_ts = self._align_timestamp(bar.timestamp)
 
@@ -133,7 +177,7 @@ class LiveDashboardServer:
         asyncio.create_task(self._broadcast({
             'type': 'bar',
             'symbol': 'ES',
-            'data': bar.to_dict()
+            'data': payload
         }))
         print(f"[ES] {bar.timestamp.strftime('%H:%M:%S')} Close: {bar.close:.2f}")
 
@@ -142,6 +186,10 @@ class LiveDashboardServer:
 
     def _on_btc_bar(self, bar: OHLCV):
         """Callback when new BTC bar completes"""
+        payload = self._bar_to_dict(bar)
+        if payload is None:
+            print("[BTC] Skipping invalid bar")
+            return
         self.latest_btc_bar = bar
         aligned_ts = self._align_timestamp(bar.timestamp)
 
@@ -159,7 +207,7 @@ class LiveDashboardServer:
         asyncio.create_task(self._broadcast({
             'type': 'bar',
             'symbol': 'BTC',
-            'data': bar.to_dict()
+            'data': payload
         }))
         print(f"[BTC] {bar.timestamp.strftime('%H:%M:%S')} Close: {bar.close:.2f}")
 
@@ -206,6 +254,7 @@ class LiveDashboardServer:
         # BTC backfill - last 24 hours of 1-min bars (1440 bars)
         try:
             btc_df = await self.binance.fetch_historical('1m', 1440)
+            btc_df = self._clean_dataframe(btc_df)
             if not btc_df.empty:
                 self.btc_backfill = [
                     {'time': int(row['timestamp'].timestamp()),
@@ -229,7 +278,8 @@ class LiveDashboardServer:
 
         # ES backfill - last 24 hours (86400 seconds)
         try:
-            es_df = self.ibkr.fetch_historical('1 D', '1 min')
+            es_df = self.ibkr.fetch_historical('3 D', '1 min')  # 3 trading days of 1-min bars
+            es_df = self._clean_dataframe(es_df)
             if es_df is not None and not es_df.empty:
                 self.es_backfill = [
                     {'time': int(row['timestamp'].timestamp()),
@@ -255,6 +305,7 @@ class LiveDashboardServer:
         print("[INIT] Fetching historical data (7 days)...")
         try:
             btc_hist = await self.binance.fetch_historical('1h', 168)
+            btc_hist = self._clean_dataframe(btc_hist)
             if not btc_hist.empty:
                 self.btc_historical = [
                     {'time': int(row['timestamp'].timestamp()),
@@ -269,6 +320,7 @@ class LiveDashboardServer:
 
         try:
             es_hist = self.ibkr.fetch_historical('7 D', '1 hour')
+            es_hist = self._clean_dataframe(es_hist)
             if es_hist is not None and not es_hist.empty:
                 self.es_historical = [
                     {'time': int(row['timestamp'].timestamp()),
@@ -350,7 +402,7 @@ class LiveDashboardServer:
                         ts = int(data['T'])  # Trade timestamp from Binance
 
                         # Only queue if price changed (reduces noise)
-                        if price != last_price:
+                        if self._is_valid_price(price) and price != last_price:
                             self.latest_btc_tick = price
                             self._queue_tick('BTC', price, ts)
                             last_price = price
@@ -384,7 +436,7 @@ class LiveDashboardServer:
                     price = t.close
 
             # Only queue if price changed
-            if price and price != last_price[0]:
+            if price is not None and self._is_valid_price(price) and price != last_price[0]:
                 self.latest_es_tick = price
                 ts = int(asyncio.get_event_loop().time() * 1000)
                 self._queue_tick('ES', price, ts)
@@ -432,6 +484,7 @@ class LiveDashboardServer:
         app = web.Application()
         app.router.add_get('/', self.index_handler)
         app.router.add_get('/ws', self.websocket_handler)
+        app.router.add_get('/reload-token', self.reload_token_handler)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -481,8 +534,23 @@ class LiveDashboardServer:
             await runner.cleanup()
             print("[OK] Shutdown complete")
 
+    def _reload_token_path(self) -> Path:
+        return Path(__file__).parent.parent / 'output' / 'reload.token'
+
+    def _load_reload_token(self) -> str:
+        try:
+            return self._reload_token_path().read_text(encoding='utf-8').strip()
+        except Exception:
+            return ''
+
+    async def reload_token_handler(self, request):
+        """Expose a tiny reload token endpoint for dev auto-refresh."""
+        token = self._load_reload_token()
+        return web.Response(text=token or '', headers={'Cache-Control': 'no-store'})
+
     def _generate_live_html(self):
         """Generate the live WebSocket-powered dashboard with correlation analysis"""
+        reload_token = self._load_reload_token() or str(int(time.time()))
         html = '''<!DOCTYPE html>
 <html>
 <head>
@@ -758,6 +826,60 @@ class LiveDashboardServer:
             border-radius: 4px;
             min-width: 80px;
         }
+        .anchor-toggle {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-left: 10px;
+        }
+        .anchor-btn {
+            font-size: 10px;
+            padding: 4px 8px;
+            background: rgba(0,0,0,0.3);
+            border: 1px solid #2a2a3e;
+            color: #787b86;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .anchor-btn.active {
+            background: #26a69a;
+            color: #fff;
+            border-color: #26a69a;
+        }
+        .measure-btn {
+            font-size: 10px;
+            padding: 4px 8px;
+            background: rgba(0,0,0,0.3);
+            border: 1px solid #2a2a3e;
+            color: #787b86;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .measure-btn.active {
+            background: #42A5F5;
+            color: #fff;
+            border-color: #42A5F5;
+        }
+        .measure-rect {
+            position: absolute;
+            background: rgba(66,165,245,0.18);
+            border: 1px dashed rgba(66,165,245,0.8);
+            pointer-events: none;
+            z-index: 100;  /* Higher than chart canvas layers */
+        }
+        .measure-label {
+            position: absolute;
+            background: rgba(10,10,15,0.92);
+            color: #fff;
+            padding: 8px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 101;  /* Higher than measure-rect */
+            border: 1px solid rgba(66,165,245,0.7);
+            white-space: nowrap;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+        }
         .signal-item.highlight {
             background: rgba(0,200,83,0.15);
             border: 1px solid rgba(0,200,83,0.3);
@@ -825,18 +947,17 @@ class LiveDashboardServer:
                 <span class="lead-label">LEAD</span>
                 <span class="lead-value" id="lead-lag-value">SYNC</span>
             </div>
+            <div class="anchor-toggle">
+                <button id="anchor-globex" class="anchor-btn active">Globex</button>
+                <button id="anchor-cash" class="anchor-btn">Cash</button>
+            </div>
+            <button id="measure-toggle" class="measure-btn">Measure</button>
         </div>
         <div class="status-section">
             <div class="status-dot" id="status-dot"></div>
             <span class="latency" id="latency-display">--ms</span>
             <span class="rate" id="btc-rate">0</span>/s
         </div>
-    </div>
-
-    <div class="measurement" id="measurement" style="display:none; position:fixed; background:#1a1a2e; padding:8px 12px; border-radius:4px; font-size:12px; z-index:1000; pointer-events:none;">
-        <div>Time: <span id="m-time">--</span></div>
-        <div>Price: <span id="m-price">--</span></div>
-        <div style="color:#787b86">Move: <span id="m-move" style="color:#00C853">--</span></div>
     </div>
 
     <div class="section-title">
@@ -911,7 +1032,23 @@ class LiveDashboardServer:
     </div>
 
     <script>
-        // Aggressively suppress LightweightCharts "Value is null" errors
+        // Lightweight logging helper (toggle flag while debugging)
+        const CHART_DEBUG = false;  // Set true to debug chart errors
+        function chartWarn(msg, ctx) {
+            if (CHART_DEBUG) {
+                console.warn('[CHART]', msg, ctx || {});
+            }
+        }
+        // Throttle helper for high-frequency chart updates
+        const _throttleMap = new Map();
+        function throttledChartOp(key, delayMs, fn) {
+            const now = Date.now();
+            const last = _throttleMap.get(key) || 0;
+            if (now - last < delayMs) return;
+            _throttleMap.set(key, now);
+            try { fn(); } catch (e) { chartWarn('throttled op failed', { key, error: e?.message }); }
+        }
+        // Suppress noisy LWC "Value is null" errors from both window errors and console
         (function() {
             const originalError = console.error;
             console.error = function(...args) {
@@ -920,24 +1057,61 @@ class LiveDashboardServer:
                 originalError.apply(console, args);
             };
         })();
-        window.onerror = function(msg) {
-            if (msg && (msg.includes('Value is null') || msg.includes('lightweight-charts'))) return true;
-            return false;
-        };
         window.addEventListener('error', function(e) {
-            if (e.message && (e.message.includes('Value is null') || e.message.includes('lightweight-charts'))) {
-                e.preventDefault(); e.stopPropagation(); return true;
+            if (e && e.message && (e.message.includes('Value is null') || e.message.includes('lightweight-charts'))) {
+                e.preventDefault();
+                e.stopPropagation();
+                return true;
             }
         }, true);
         window.addEventListener('unhandledrejection', function(e) {
-            if (e.reason && String(e.reason).includes('Value is null')) { e.preventDefault(); return true; }
+            if (e.reason && String(e.reason).includes('Value is null')) {
+                e.preventDefault();
+                return true;
+            }
         });
+        // Session anchor modes for ES % base
+        const ANCHOR_MODES = { GLOBEX: 'globex', CASH: 'cash' };
+
+        // --- Dev live-reload hook (polls reload token and refreshes on change) ---
+        const RELOAD_TOKEN = ''' + f"'{reload_token}'" + ''';
+        setInterval(async () => {
+            try {
+                const res = await fetch('/reload-token', { cache: 'no-store' });
+                const txt = await res.text();
+                if (txt && txt.trim() !== RELOAD_TOKEN) {
+                    console.log('[DEV] Reload token changed, refreshing...');
+                    window.location.reload();
+                }
+            } catch (err) {
+                // ignore fetch errors (server restarting)
+            }
+        }, 2000);
+        // ------------------------------------------------------------------------
 
         // Helper: validate range before time scale sync
         function isValidRange(range) {
             return range && range.from != null && range.to != null &&
                    typeof range.from === 'number' && typeof range.to === 'number' &&
                    isFinite(range.from) && isFinite(range.to) && range.from < range.to;
+        }
+
+        // Interaction lock to detect wheel / touch / pinch / scroll gestures
+        function createInteractionLock(debounceMs = 300) {
+            let active = false;
+            let timer = null;
+
+            function activate() {
+                active = true;
+                if (timer) clearTimeout(timer);
+                timer = setTimeout(() => { active = false; }, debounceMs);
+            }
+
+            ['wheel', 'touchstart', 'touchmove'].forEach(evt => {
+                document.addEventListener(evt, activate, { passive: true });
+            });
+
+            return () => active;
         }
 
         // Chart setup with full navigation
@@ -956,6 +1130,53 @@ class LiveDashboardServer:
             handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
             handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true }
         };
+
+        // Global interaction guard used by sync logic
+        const isUserInteracting = createInteractionLock(400);
+        function isAnyInteraction() {
+            return isDragging || overlayDragging || isUserInteracting();
+        }
+
+        // === Session anchor helpers (ES % base) ===
+        const ANCHOR_DEFAULT = ANCHOR_MODES.GLOBEX;
+        let esAnchorMode = ANCHOR_DEFAULT;
+        let esAnchorTs = null;  // seconds
+
+        function getEtOffsetMs() {
+            const now = new Date();
+            const utcNow = new Date(now.toLocaleString('en-US', { timeZone: 'UTC' }));
+            const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+            return utcNow.getTime() - etNow.getTime();  // UTC minus ET
+        }
+
+        function computeAnchorTimestamp(mode) {
+            const now = new Date();
+            const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+            const offsetMs = getEtOffsetMs();
+            const isCash = mode === ANCHOR_MODES.CASH;
+            const hour = isCash ? 9 : 18;
+            const minute = isCash ? 30 : 0;
+            const anchorEt = new Date(etNow.getFullYear(), etNow.getMonth(), etNow.getDate(), hour, minute, 0, 0);
+            let anchorUtcMs = anchorEt.getTime() + offsetMs;
+            const nowUtcMs = Date.now();
+            if (nowUtcMs < anchorUtcMs) {
+                anchorUtcMs -= 24 * 3600 * 1000;  // roll to previous day
+            }
+            return Math.floor(anchorUtcMs / 1000);
+        }
+
+        function findBasePrice(dataArray, anchorSeconds) {
+            if (!dataArray || dataArray.length === 0) return null;
+            let base = dataArray[0].close;
+            if (!anchorSeconds) return base;
+            for (const d of dataArray) {
+                if (d.time >= anchorSeconds) {
+                    base = d.close;
+                    break;
+                }
+            }
+            return base;
+        }
 
         // Create charts
         const esRtChart = LightweightCharts.createChart(document.getElementById('es-realtime'),
@@ -1072,10 +1293,31 @@ class LiveDashboardServer:
         });
 
         // CRITICAL: Sync overlay chart with volume chart - PIXEL PERFECT alignment!
+        // Track drag state for overlay chart (shared with crosshair sync)
+        let overlayDragging = false;
+        let overlayDragTimer = null;
         let syncingOverlay = false;
 
+        function markOverlayDragging() {
+            overlayDragging = true;
+            if (overlayDragTimer) clearTimeout(overlayDragTimer);
+            overlayDragTimer = setTimeout(() => { overlayDragging = false; }, 400);
+        }
+
+        // Track mouse/touch/scroll state on overlay chart containers
+        const overlayMainEl = document.getElementById('overlay-main-chart');
+        const overlayVolEl = document.getElementById('overlay-volume-chart');
+        [overlayMainEl, overlayVolEl].forEach(el => {
+            if (el) {
+                ['mousedown', 'mouseup', 'mouseleave', 'wheel', 'touchstart', 'touchmove'].forEach(evt => {
+                    el.addEventListener(evt, markOverlayDragging, { passive: true });
+                });
+            }
+        });
+
         function syncVolToMain() {
-            if (syncingOverlay) return;
+            // Don't sync during drag - causes errors
+            if (syncingOverlay || overlayDragging) return;
             syncingOverlay = true;
             try {
                 // Sync visible range
@@ -1099,12 +1341,12 @@ class LiveDashboardServer:
             syncingOverlay = false;
         }
 
-        // Main chart drives the volume chart - sync on both events
+        // Main chart drives the volume chart - sync on both events (but not during drag)
         overlayChart.timeScale().subscribeVisibleLogicalRangeChange(() => {
-            if (!syncingOverlay) syncVolToMain();
+            if (!syncingOverlay && !overlayDragging) syncVolToMain();
         });
         overlayChart.timeScale().subscribeVisibleTimeRangeChange(() => {
-            if (!syncingOverlay) syncVolToMain();
+            if (!syncingOverlay && !overlayDragging) syncVolToMain();
         });
 
         // Store data for overlay
@@ -1114,6 +1356,7 @@ class LiveDashboardServer:
         let currentOverlayBtcBar = null;
         let currentOverlayEsBar = null;
         let overlayEsPriceLine = null;
+        let overlayResetting = false;  // guard to avoid update/setData races
 
         // ES price label positioning function
         function updateEsPriceLabel(esPrice, esPctValue) {
@@ -1132,35 +1375,43 @@ class LiveDashboardServer:
                     const y = overlayEsSeries.priceToCoordinate(esPctValue);
                     if (y != null && isFinite(y) && y > 0 && y < 600) {
                         label.style.top = (y - 8) + 'px';  // Center vertically on the line
+                    } else {
+                        chartWarn('skip price label - offscreen', { esPctValue, y });
                     }
                 }
             } catch (e) {
-                // Chart not ready yet - silently ignore
+                chartWarn('price label update failed', { error: e?.message });
             }
         }
 
         // Re-position ES label when chart scales/zooms - use RAF for smooth updates
+        // Skip during drag to prevent errors
         let esPriceLabelRaf = null;
         overlayChart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+            if (overlayDragging) return;  // Don't update during drag
             if (esPriceLabelRaf) cancelAnimationFrame(esPriceLabelRaf);
             esPriceLabelRaf = requestAnimationFrame(() => {
+                if (overlayDragging) return;  // Double-check after RAF
                 if (esData.length > 0 && overlayEsBase && overlayEsData.length > 0) {
                     const lastEs = esData[esData.length - 1];
                     const esPct = ((lastEs.close - overlayEsBase) / overlayEsBase) * 100;
-                    updateEsPriceLabel(lastEs.close, esPct);
+                    try { updateEsPriceLabel(lastEs.close, esPct); } catch(e) {}
                 }
             });
         });
 
         // Fast tick update for overlay chart (called on each tick)
+        // Skip during drag to prevent "Value is null" errors
         function updateOverlayTick(symbol, price) {
+            if (overlayDragging || overlayResetting || isAnyInteraction()) return;  // Don't update series during drag/zoom/reset
             try {
                 if (price == null || !isFinite(price)) return;
 
                 const now = Math.floor(Date.now() / 1000 / 60) * 60;
 
                 if (symbol === 'BTC') {
-                    // Update BTC candle
+                    // Update BTC candle - with visible range guard
+                    if (overlayBtcData.length === 0) return;  // Need initial data first
                     if (!currentOverlayBtcBar || currentOverlayBtcBar.time !== now) {
                         const lastClose = btcData.length > 0 ? btcData[btcData.length - 1].close : price;
                         currentOverlayBtcBar = { time: now, open: lastClose, high: price, low: price, close: price };
@@ -1169,7 +1420,11 @@ class LiveDashboardServer:
                         currentOverlayBtcBar.low = Math.min(currentOverlayBtcBar.low, price);
                         currentOverlayBtcBar.close = price;
                     }
-                    overlayBtcSeries.update(currentOverlayBtcBar);
+                    // Only update if chart has valid visible range
+                    const visRange = overlayChart.timeScale().getVisibleLogicalRange();
+                    if (isValidRange(visRange)) {
+                        throttledChartOp('overlay-btc', 50, () => overlayBtcSeries.update(currentOverlayBtcBar));
+                    }
 
                     // Update header
                     const btcPriceEl = document.getElementById('overlay-btc-price');
@@ -1184,16 +1439,21 @@ class LiveDashboardServer:
                         }
                     }
                 } else if (symbol === 'ES') {
-                    // Update ES % line
-                    if (overlayEsBase && esData.length > 0) {
+                    // Update ES % line - with visible range guard
+                    if (overlayEsBase && esData.length > 0 && overlayEsData.length > 0) {
                         const esPct = ((price - overlayEsBase) / overlayEsBase) * 100;
+                        if (!isFinite(esPct)) return;
 
                         if (!currentOverlayEsBar || currentOverlayEsBar.time !== now) {
                             currentOverlayEsBar = { time: now, value: esPct };
                         } else {
                             currentOverlayEsBar.value = esPct;
                         }
-                        overlayEsSeries.update(currentOverlayEsBar);
+                        // Only update if chart has valid visible range
+                        const visRange = overlayChart.timeScale().getVisibleLogicalRange();
+                        if (isValidRange(visRange)) {
+                            throttledChartOp('overlay-es', 50, () => overlayEsSeries.update(currentOverlayEsBar));
+                        }
 
                         // Update header with ES price and %
                         const esPriceEl = document.getElementById('overlay-es-price');
@@ -1214,41 +1474,54 @@ class LiveDashboardServer:
         }
 
         // Function to update overlay chart (full reset - called on bar completion)
+        // Skip during drag to prevent errors
         function updateOverlayChart() {
-            if (btcData.length < 2 || esData.length < 2) return;
+            if (overlayDragging) return;  // Don't reset data during drag
+            // Allow partial rendering: only skip if BOTH datasets are empty
+            if (btcData.length === 0 && esData.length === 0) return;
 
-            // Use realtime data
-            overlayBtcData = btcData.slice();
-            overlayBtcSeries.setData(overlayBtcData);
-
-            // Calculate ES % change from first bar
-            if (!overlayEsBase && esData.length > 0) {
-                overlayEsBase = esData[0].close;
-            }
-
-            if (overlayEsBase) {
-                overlayEsData = esData.map(d => ({
-                    time: d.time,
-                    value: ((d.close - overlayEsBase) / overlayEsBase) * 100
-                }));
-                overlayEsSeries.setData(overlayEsData);
-            }
-
-            // Volume with color - normalize large BTC volumes
-            const volData = btcData.map(d => ({
-                time: d.time,
-                value: d.volume || 0,
-                color: d.close >= d.open ? 'rgba(38, 166, 154, 0.6)' : 'rgba(239, 83, 80, 0.6)'
-            })).filter(d => d.value > 0);
-            overlayBtcVolSeries.setData(volData);
-
-            // Sync time scales - volume follows main chart EXACTLY
+            overlayResetting = true;
             try {
-                overlayChart.timeScale().fitContent();
-                // Force perfect sync after a brief delay for rendering
-                setTimeout(() => syncVolToMain(), 50);
-                setTimeout(() => syncVolToMain(), 200);
-            } catch(e) {}
+                // BTC overlay (candlesticks + volume) - only if we have BTC data
+                if (btcData.length > 0) {
+                    overlayBtcData = btcData.slice();
+                    try { overlayBtcSeries.setData(overlayBtcData); } catch(e) { chartWarn('overlay btc setData failed', { error: e?.message }); }
+
+                    // Volume with color
+                    const volData = btcData.map(d => ({
+                        time: d.time,
+                        value: d.volume || 0,
+                        color: d.close >= d.open ? 'rgba(38, 166, 154, 0.6)' : 'rgba(239, 83, 80, 0.6)'
+                    })).filter(d => d.value > 0);
+                    try { overlayBtcVolSeries.setData(volData); } catch(e) { chartWarn('overlay vol setData failed', { error: e?.message }); }
+                }
+
+                // ES overlay (% line) - only if we have ES data and base price
+                if (esData.length > 0) {
+                    if (!overlayEsBase) {
+                        overlayEsBase = esBasePrice ?? esData[0].close;
+                    }
+                    if (overlayEsBase) {
+                        overlayEsData = esData.map(d => ({
+                            time: d.time,
+                            value: ((d.close - overlayEsBase) / overlayEsBase) * 100
+                        }));
+                        try { overlayEsSeries.setData(overlayEsData); } catch(e) { chartWarn('overlay es setData failed', { error: e?.message }); }
+                    }
+                }
+
+                // Sync time scales - volume follows main chart EXACTLY
+                if (!overlayDragging) {
+                    overlayChart.timeScale().fitContent();
+                    // Force perfect sync after a brief delay for rendering
+                    setTimeout(() => { if (!overlayDragging) syncVolToMain(); }, 50);
+                    setTimeout(() => { if (!overlayDragging) syncVolToMain(); }, 200);
+                }
+            } catch(e) {
+                // Chart mid-transition - ignore
+            } finally {
+                setTimeout(() => { overlayResetting = false; }, 100);  // leave guard up briefly to avoid async render race
+            }
 
             // Update header values
             if (btcData.length > 0) {
@@ -1281,7 +1554,7 @@ class LiveDashboardServer:
                 }
 
                 // Update floating ES price label on right axis
-                updateEsPriceLabel(lastEs.close, esPct);
+                try { updateEsPriceLabel(lastEs.close, esPct); } catch(e) {}
             }
         }
         // ========== END: TradingView-Style Overlay Chart ==========
@@ -1289,81 +1562,167 @@ class LiveDashboardServer:
         // Charts are INDEPENDENT - each can be dragged/zoomed separately
         // Only crosshairs are synced (below) for visual comparison
 
-        // Measurement state
-        let measureStart = null;
-        const measureEl = document.getElementById('measurement');
+        // Measurement placeholder (legacy tooltip removed); keep a safe clear hook
+        function resetMeasurement() {
+            try { clearAllMeasurements(); } catch (e) { /* ignore */ }
+        }
 
-        // Sync crosshairs between paired charts with measurement
-        // Track if user is dragging (don't sync during drag)
+        // Sync crosshairs between paired charts
+        // Track if user is dragging/zooming (don't sync during interaction)
         let isDragging = false;
-        document.addEventListener('mousedown', () => { isDragging = true; });
-        document.addEventListener('mouseup', () => { isDragging = false; });
+        let dragTimer = null;
+        function markDragging() {
+            isDragging = true;
+            if (dragTimer) clearTimeout(dragTimer);
+            dragTimer = setTimeout(() => { isDragging = false; }, 400);
+        }
+        // NOTE: mousedown/mouseup removed - they block measurement clicks!
+        // Only wheel/touch events should trigger drag detection
+        ['wheel', 'touchstart', 'touchmove'].forEach(evt => {
+            document.addEventListener(evt, markDragging, { passive: true });
+        });
+
+        // Find nearest timestamp in data array (binary search)
+        // This is critical because ES and BTC have different trading hours
+        function findNearestTime(dataArray, targetTime) {
+            if (!dataArray || dataArray.length === 0) return null;
+
+            let left = 0;
+            let right = dataArray.length - 1;
+
+            // Binary search
+            while (left < right) {
+                const mid = Math.floor((left + right) / 2);
+                if (dataArray[mid].time < targetTime) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+
+            // Bounds check: if left exceeds array, return last element
+            if (left >= dataArray.length) {
+                return dataArray[dataArray.length - 1];
+            }
+
+            // Check if left or left-1 is closer
+            if (left > 0) {
+                const diffLeft = Math.abs(dataArray[left].time - targetTime);
+                const diffPrev = Math.abs(dataArray[left - 1].time - targetTime);
+                if (diffPrev < diffLeft) {
+                    return dataArray[left - 1];
+                }
+            }
+
+            return dataArray[left];
+        }
+
+        const CROSSHAIR_TOLERANCE = 60;  // seconds for 1m charts
 
         function syncCharts(chart1, series1, chart2, series2, dataArray, label) {
             chart1.subscribeCrosshairMove(param => {
-                // Don't sync during drag operations - this causes errors
-                if (isDragging) return;
+                // Don't sync during interactions (but don't clear measurement - keep it sticky)
+                if (isAnyInteraction()) return;
 
                 try {
-                    // Only process if this is from actual mouse hover (param.point exists)
-                    if (param.time != null && param.point && param.seriesData) {
+                    if (param && param.time != null && param.point && param.seriesData) {
                         const data = param.seriesData.get(series1);
                         const price = data ? (data.close ?? data.value) : null;
+                        const targetData = dataArray;
+                        if (price == null || !isFinite(price)) return;
+                        if (!chart2 || !series2 || !targetData || targetData.length === 0) return;
 
-                        if (price != null && typeof price === 'number' && isFinite(price)) {
-                            // Only sync if target has data and time is in range
-                            if (dataArray && dataArray.length > 0) {
-                                const firstTime = dataArray[0].time;
-                                const lastTime = dataArray[dataArray.length - 1].time;
-                                if (param.time >= firstTime && param.time <= lastTime) {
-                                    try {
-                                        chart2.setCrosshairPosition(price, param.time, series2);
-                                    } catch(e) {}
-                                }
-                            }
+                        const nearestBar = findNearestTime(targetData, param.time);
+                        if (!nearestBar || nearestBar.time == null) return;
 
-                            // Show measurement tooltip
-                            const time = new Date(param.time * 1000);
-                            document.getElementById('m-time').textContent = time.toLocaleTimeString();
-                            document.getElementById('m-price').textContent = price.toFixed(2);
+                        const timeDelta = Math.abs(nearestBar.time - param.time);
+                        if (timeDelta > CROSSHAIR_TOLERANCE) return;
 
-                            if (measureStart === null) measureStart = { time: param.time, price: price };
-                            if (measureStart.price) {
-                                const priceDiff = price - measureStart.price;
-                                const pctMove = ((priceDiff / measureStart.price) * 100).toFixed(3);
-                                const timeDiff = Math.round((param.time - measureStart.time) / 60);
-                                const sign = priceDiff >= 0 ? '+' : '';
-                                document.getElementById('m-move').textContent = `${sign}${priceDiff.toFixed(2)} (${sign}${pctMove}%) / ${timeDiff}min`;
-                                document.getElementById('m-move').style.color = priceDiff >= 0 ? '#00C853' : '#ef5350';
-                            }
+                        const nearestPrice = nearestBar.close ?? nearestBar.value ?? price;
+                        if (nearestPrice == null || !isFinite(nearestPrice)) return;
 
-                            if (measureEl) {
-                                measureEl.style.display = 'block';
-                                measureEl.style.left = (param.point.x + 20) + 'px';
-                                measureEl.style.top = (param.point.y + 20) + 'px';
-                            }
+                        const visRange = chart2.timeScale().getVisibleRange();
+                        if (!visRange || !isFinite(visRange.from) || !isFinite(visRange.to)) return;
+                        if (nearestBar.time < visRange.from || nearestBar.time > visRange.to) return;
+
+                        try {
+                            chart2.setCrosshairPosition(nearestPrice, nearestBar.time, series2);
+                        } catch (syncErr) {
+                            chartWarn('crosshair sync failed', { error: syncErr?.message, time: nearestBar.time });
                         }
-                    } else if (!param.point) {
-                        // Mouse left chart area
+                    } else if (!param || !param.point) {
                         try { chart2.clearCrosshairPosition(); } catch(e) {}
-                        if (measureEl) measureEl.style.display = 'none';
-                        measureStart = null;
+                        // Don't clear measurement - keep it sticky
                     }
-                } catch (e) {}
+                } catch (e) {
+                    chartWarn('syncCharts error', { error: e?.message });
+                }
             });
         }
+        // Hide crosshair when leaving chart wrappers (but keep measurement sticky)
+        [
+            { el: document.getElementById('es-realtime'), chart: esRtChart, target: btcRtChart },
+            { el: document.getElementById('btc-realtime'), chart: btcRtChart, target: esRtChart },
+            { el: document.getElementById('es-historical'), chart: esHistChart, target: btcHistChart },
+            { el: document.getElementById('btc-historical'), chart: btcHistChart, target: esHistChart },
+        ].forEach(({ el, chart, target }) => {
+            if (!el || !chart || !target) return;
+            el.addEventListener('mouseleave', () => {
+                try { chart.clearCrosshairPosition(); } catch(e) {}
+                try { target.clearCrosshairPosition(); } catch(e) {}
+                // Don't clear measurement on mouseleave - keep it sticky
+                // User must click Measure button or press Escape to clear
+            });
+        });
         // Data storage for charts (IMMUTABLE bars - ticks don't modify these)
         let esData = [];
         let btcData = [];
         let esHistData = [];
         let btcHistData = [];
 
-        // Sync real-time charts (pass data arrays for time range validation)
-        syncCharts(esRtChart, esRtSeries, btcRtChart, btcRtSeries, btcData, 'ES');
-        syncCharts(btcRtChart, btcRtSeries, esRtChart, esRtSeries, esData, 'BTC');
-        // Sync historical charts
-        syncCharts(esHistChart, esHistSeries, btcHistChart, btcHistSeries, btcHistData, 'ES');
-        syncCharts(btcHistChart, btcHistSeries, esHistChart, esHistSeries, esHistData, 'BTC');
+        // Anchor mode toggles
+        document.getElementById('anchor-globex')?.addEventListener('click', () => applyEsAnchor(ANCHOR_MODES.GLOBEX));
+        document.getElementById('anchor-cash')?.addEventListener('click', () => applyEsAnchor(ANCHOR_MODES.CASH));
+
+        // Range measurement toggle (button OR Shift+click)
+        let measureMode = false;
+        const measureBtn = document.getElementById('measure-toggle');
+        if (measureBtn) {
+            measureBtn.addEventListener('click', () => {
+                measureMode = !measureMode;
+                measureBtn.classList.toggle('active', measureMode);
+                // Clear any existing measurements when turning off
+                if (!measureMode) {
+                    clearAllMeasurements();
+                }
+            });
+        }
+        // Keyboard shortcuts: Shift to measure, Escape to clear
+        let shiftMeasure = false;
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Shift') shiftMeasure = true;
+            if (e.key === 'Escape') clearAllMeasurements();
+        });
+        window.addEventListener('keyup', (e) => { if (e.key === 'Shift') shiftMeasure = false; });
+
+        // Sync registration deferred until data arrives (prevents null errors during init)
+        let syncRegistered = false;
+        function registerCrosshairSync() {
+            if (syncRegistered) return;
+            // Only register sync if we have data
+            if (esData.length === 0 || btcData.length === 0) {
+                chartWarn('sync deferred: waiting for data', { es: esData.length, btc: btcData.length });
+                return;
+            }
+            syncRegistered = true;
+            // Sync real-time charts (pass data arrays for time range validation)
+            syncCharts(esRtChart, esRtSeries, btcRtChart, btcRtSeries, btcData, 'ES');
+            syncCharts(btcRtChart, btcRtSeries, esRtChart, esRtSeries, esData, 'BTC');
+            // Sync historical charts
+            syncCharts(esHistChart, esHistSeries, btcHistChart, btcHistSeries, btcHistData, 'ES');
+            syncCharts(btcHistChart, btcHistSeries, esHistChart, esHistSeries, esHistData, 'BTC');
+            console.log('[SYNC] Crosshair sync registered after data loaded');
+        }
 
         // Current incomplete bar tracking (separate from completed bars)
         let currentEsBar = null;
@@ -1427,6 +1786,210 @@ class LiveDashboardServer:
             }
         }
 
+        // ========== RANGE MEASUREMENT ==========
+        function getPriceFromCoordinate(series, chart, y) {
+            // LightweightCharts v4.1.0 - use series.coordinateToPrice directly
+            try {
+                // Method 1: Direct series method (LWC v4+)
+                if (typeof series.coordinateToPrice === 'function') {
+                    const val = series.coordinateToPrice(y);
+                    if (val != null && isFinite(val)) return val;
+                }
+                // Method 2: Try chart's right price scale
+                const rightScale = chart.priceScale('right');
+                if (rightScale && typeof rightScale.coordinateToPrice === 'function') {
+                    const val = rightScale.coordinateToPrice(y);
+                    if (val != null && isFinite(val)) return val;
+                }
+                // Method 3: Try chart's left price scale
+                const leftScale = chart.priceScale('left');
+                if (leftScale && typeof leftScale.coordinateToPrice === 'function') {
+                    const val = leftScale.coordinateToPrice(y);
+                    if (val != null && isFinite(val)) return val;
+                }
+            } catch (e) {
+                // Silently fail - price conversion not critical
+            }
+            return null;
+        }
+
+        function setupRangeMeasure(containerId, chart, series, getDataArray) {
+            const container = document.getElementById(containerId);
+            if (!container || !chart || !series) return { clear() {} };
+
+            const rect = document.createElement('div');
+            rect.className = 'measure-rect';
+            rect.style.display = 'none';
+            const label = document.createElement('div');
+            label.className = 'measure-label';
+            label.style.display = 'none';
+            container.appendChild(rect);
+            container.appendChild(label);
+
+            let start = null;
+            let locked = false;  // TradingView-style: second click locks the measurement
+
+            function clear() {
+                start = null;
+                locked = false;
+                rect.style.display = 'none';
+                label.style.display = 'none';
+            }
+
+            function pickSeries(point) {
+                let targetSeries = series;
+                let seriesLabel = '';
+
+                if (chart === overlayChart && overlayEsSeries && overlayBtcSeries) {
+                    // Choose nearest series by vertical distance
+                    const esVal = overlayEsData && overlayEsData.length ? overlayEsData[overlayEsData.length - 1].value : null;
+                    const btcVal = overlayBtcData && overlayBtcData.length ? overlayBtcData[overlayBtcData.length - 1].close : null;
+                    const esY = (esVal != null && overlayEsSeries.priceToCoordinate) ? overlayEsSeries.priceToCoordinate(esVal) : null;
+                    const btcY = (btcVal != null && overlayBtcSeries.priceToCoordinate) ? overlayBtcSeries.priceToCoordinate(btcVal) : null;
+                    const dyEs = esY != null && point?.y != null ? Math.abs(point.y - esY) : Number.POSITIVE_INFINITY;
+                    const dyBtc = btcY != null && point?.y != null ? Math.abs(point.y - btcY) : Number.POSITIVE_INFINITY;
+                    if (dyEs < dyBtc) {
+                        targetSeries = overlayEsSeries;
+                        seriesLabel = 'ES %';
+                    } else {
+                        targetSeries = overlayBtcSeries;
+                        seriesLabel = 'BTC $';
+                    }
+                }
+                return { targetSeries, seriesLabel };
+            }
+
+            function updateSelection(point) {
+                if (!start || !point || point.x == null || point.y == null) return;
+
+                // Use series chosen at anchor
+                const targetSeries = start.series || series;
+                const seriesLabel = start.seriesLabel || '';
+
+                // Data array depends on chosen series (overlay needs special handling)
+                let dataArr = getDataArray ? getDataArray() : [];
+                if (chart === overlayChart) {
+                    if (targetSeries === overlayEsSeries) dataArr = overlayEsData || [];
+                    else if (targetSeries === overlayBtcSeries) dataArr = overlayBtcData || [];
+                }
+                if (!dataArr || dataArr.length === 0) return;
+
+                // Convert pixel to time/price (use safe helper for price)
+                const endTime = chart.timeScale().coordinateToTime(point.x);
+                const endPrice = getPriceFromCoordinate(targetSeries, chart, point.y);
+                if (endTime == null || endPrice == null || !isFinite(endPrice)) return;
+
+                if (start.time == null) return;
+
+                // Coordinates
+                const x1 = start.x;
+                const y1 = start.y;
+                const x2 = point.x;
+                const y2 = point.y;
+                if ([x1, y1, x2, y2].some(v => v == null || !isFinite(v))) return;
+
+                const left = Math.min(x1, x2);
+                const width = Math.abs(x2 - x1);
+                const top = Math.min(y1, y2);
+                const height = Math.abs(y2 - y1);
+
+                rect.style.display = 'block';
+                rect.style.left = `${left}px`;
+                rect.style.top = `${top}px`;
+                rect.style.width = `${width}px`;
+                rect.style.height = `${height}px`;
+
+                // Validate start.price before calculations
+                if (start.price == null || !isFinite(start.price)) return;
+                const priceDiff = endPrice - start.price;
+                const pct = Math.abs(start.price) > 1e-6 ? (priceDiff / start.price) * 100 : null;
+
+                let bars = 0;
+                let vol = 0;
+                const tMin = Math.min(start.time, endTime);
+                const tMax = Math.max(start.time, endTime);
+                const within = dataArr.filter(d => d.time >= tMin && d.time <= tMax);
+                if (within.length > 0) {
+                    bars = within.length;
+                    vol = within.reduce((s, d) => s + (d.volume || 0), 0);
+                }
+
+                const seconds = Math.abs(endTime - start.time);
+                const minutes = Math.round(seconds / 60);
+
+                label.style.display = 'block';
+                label.style.left = `${left + width / 2}px`;
+                label.style.top = `${top - 28}px`;
+                label.style.transform = 'translateX(-50%)';
+
+                // TV-style coloring: blue for up, red for down
+                const isUp = priceDiff >= 0;
+                rect.style.background = isUp ? 'rgba(66,165,245,0.18)' : 'rgba(239,83,80,0.18)';
+                rect.style.borderColor = isUp ? 'rgba(66,165,245,0.8)' : 'rgba(239,83,80,0.8)';
+                label.style.background = isUp ? 'rgba(28,50,78,0.95)' : 'rgba(78,28,32,0.95)';
+                label.style.borderColor = isUp ? 'rgba(66,165,245,0.8)' : 'rgba(239,83,80,0.8)';
+
+                const isPercentSeries = seriesLabel.includes('%');
+                const diffDisplay = isPercentSeries ? `${priceDiff.toFixed(2)}%` : priceDiff.toFixed(2);
+                const pctDisplay = isPercentSeries ? '' : ` (${isUp ? '+' : ''}${pct != null ? pct.toFixed(2) : '0.00'}%)`;
+                const seriesTag = seriesLabel ? ` · ${seriesLabel}` : '';
+                const volDisplay = vol ? ` · Vol ${vol.toFixed(0)}` : '';
+                label.textContent = `${diffDisplay}${pctDisplay}${seriesTag} · ${bars} bars · ${minutes}m${volDisplay}`;
+            }
+
+            // TradingView-style measurement:
+            // 1st click: set start anchor, measurement follows mouse
+            // 2nd click: lock measurement in place
+            // 3rd click: start new measurement (clears old one)
+            chart.subscribeClick(param => {
+                if (!(measureMode || shiftMeasure) || !param || !param.point) return;
+                const { targetSeries, seriesLabel } = pickSeries(param.point);
+                const time = chart.timeScale().coordinateToTime(param.point.x);
+                const price = getPriceFromCoordinate(targetSeries, chart, param.point.y);
+                if (time == null || price == null || !isFinite(price)) return;
+
+                if (!start) {
+                    // First click: set start anchor
+                    start = { x: param.point.x, y: param.point.y, time, price, series: targetSeries, seriesLabel };
+                    locked = false;
+                    updateSelection(param.point);
+                } else if (!locked) {
+                    // Second click: lock the measurement
+                    locked = true;
+                    updateSelection(param.point);  // Final update with click position
+                } else {
+                    // Third click: start new measurement
+                    start = { x: param.point.x, y: param.point.y, time, price, series: targetSeries, seriesLabel };
+                    locked = false;
+                    updateSelection(param.point);
+                }
+            });
+
+            chart.subscribeCrosshairMove(param => {
+                // Don't update if locked (measurement is finalized)
+                if (locked) return;
+                if (!start) return;
+                if (!param || !param.point) return;
+                if (isDragging) return;
+                updateSelection(param.point);
+            });
+
+            return { clear };
+        }
+
+        const measurementManagers = [];
+        function clearAllMeasurements() {
+            measurementManagers.forEach(m => m && m.clear && m.clear());
+        }
+
+        // Range measurement per chart (Shift+click to measure)
+        measurementManagers.push(setupRangeMeasure('es-realtime', esRtChart, esRtSeries, () => esData));
+        measurementManagers.push(setupRangeMeasure('btc-realtime', btcRtChart, btcRtSeries, () => btcData));
+        measurementManagers.push(setupRangeMeasure('es-historical', esHistChart, esHistSeries, () => esHistData));
+        measurementManagers.push(setupRangeMeasure('btc-historical', btcHistChart, btcHistSeries, () => btcHistData));
+        // Overlay chart (correlation) - uses BTC candlestick series for measurement
+        measurementManagers.push(setupRangeMeasure('overlay-main-chart', overlayChart, overlayBtcSeries, () => overlayBtcData));
+
         // Ultra-fast price update with requestAnimationFrame batching
         function updatePrice(element, price, lastPrice) {
             if (!element || price === undefined || price === null) return;
@@ -1442,6 +2005,31 @@ class LiveDashboardServer:
         // Base prices for % change calculation
         let esBasePrice = null;
         let btcBasePrice = null;
+        function applyEsAnchor(mode) {
+            esAnchorMode = mode;
+            esAnchorTs = computeAnchorTimestamp(mode);
+            const base = findBasePrice(esData, esAnchorTs);
+            if (base != null && isFinite(base)) {
+                esBasePrice = base;
+                overlayEsBase = base;
+            } else if (esData.length > 0) {
+                esBasePrice = esData[0].close;
+                overlayEsBase = esBasePrice;
+            }
+            // Recompute overlay and header % after base change
+            updatePctChange();
+            updateOverlayChart();
+            // Toggle button states
+            document.getElementById('anchor-globex')?.classList.toggle('active', esAnchorMode === ANCHOR_MODES.GLOBEX);
+            document.getElementById('anchor-cash')?.classList.toggle('active', esAnchorMode === ANCHOR_MODES.CASH);
+        }
+        function refreshAnchorIfNeeded() {
+            const newAnchor = computeAnchorTimestamp(esAnchorMode);
+            if (newAnchor !== esAnchorTs) {
+                applyEsAnchor(esAnchorMode);
+            }
+        }
+        setInterval(refreshAnchorIfNeeded, 60 * 1000);  // check every minute
 
         // Update % change display
         function updatePctChange() {
@@ -1468,6 +2056,7 @@ class LiveDashboardServer:
 
                 if (symbol === 'ES') {
                     if (esHistData.length === 0) return;
+                    if (isAnyInteraction()) return;
 
                     const lastBar = esHistData[esHistData.length - 1];
                     if (!lastBar || lastBar.close == null) return;
@@ -1489,9 +2078,10 @@ class LiveDashboardServer:
                         currentEsHourBar.low = Math.min(currentEsHourBar.low, price);
                         currentEsHourBar.close = price;
                     }
-                    esHistSeries.update(currentEsHourBar);
+                    throttledChartOp('hourly-es', 50, () => { esHistSeries.update(currentEsHourBar); });
                 } else if (symbol === 'BTC') {
                     if (btcHistData.length === 0) return;
+                    if (isAnyInteraction()) return;
 
                     const lastBar = btcHistData[btcHistData.length - 1];
                     if (!lastBar || lastBar.close == null) return;
@@ -1513,7 +2103,7 @@ class LiveDashboardServer:
                         currentBtcHourBar.low = Math.min(currentBtcHourBar.low, price);
                         currentBtcHourBar.close = price;
                     }
-                    btcHistSeries.update(currentBtcHourBar);
+                    throttledChartOp('hourly-btc', 50, () => { btcHistSeries.update(currentBtcHourBar); });
                 }
             } catch (e) {
                 // Silently ignore hourly bar update errors
@@ -1583,9 +2173,9 @@ class LiveDashboardServer:
             const hourlyCorr = data['1h'].correlation;
 
             // Calculate recent moves (last 5 bars)
-            const esMove = esData.length > 5 ?
+            const esMove = esData.length >= 6 ?
                 ((esData[esData.length-1].close - esData[esData.length-6].close) / esData[esData.length-6].close) * 100 : 0;
-            const btcMove = btcData.length > 5 ?
+            const btcMove = btcData.length >= 6 ?
                 ((btcData[btcData.length-1].close - btcData[btcData.length-6].close) / btcData[btcData.length-6].close) * 100 : 0;
 
             // Trading logic based on correlation
@@ -1645,14 +2235,13 @@ class LiveDashboardServer:
                     // Load backfill data (COMPLETED bars only)
                     if (msg.es_backfill && msg.es_backfill.length) {
                         esData = msg.es_backfill;
-                        esRtSeries.setData(esData);
+                        try { esRtSeries.setData(esData); } catch(e) {}
                         lastEsPrice = esData[esData.length - 1].close;
-                        esBasePrice = esData[0].close;  // Set base for % change
                         updatePrice(document.getElementById('es-price'), lastEsPrice, null);
                     }
                     if (msg.btc_backfill && msg.btc_backfill.length) {
                         btcData = msg.btc_backfill;
-                        btcRtSeries.setData(btcData);
+                        try { btcRtSeries.setData(btcData); } catch(e) {}
                         lastBtcPrice = btcData[btcData.length - 1].close;
                         btcBasePrice = btcData[0].close;  // Set base for % change
                         updatePrice(document.getElementById('btc-price'), lastBtcPrice, null);
@@ -1661,11 +2250,21 @@ class LiveDashboardServer:
                     // Load historical
                     if (msg.es_historical && msg.es_historical.length) {
                         esHistData = msg.es_historical;
-                        esHistSeries.setData(esHistData);
+                        try { esHistSeries.setData(esHistData); } catch(e) {}
                     }
                     if (msg.btc_historical && msg.btc_historical.length) {
                         btcHistData = msg.btc_historical;
-                        btcHistSeries.setData(btcHistData);
+                        try { btcHistSeries.setData(btcHistData); } catch(e) {}
+                    }
+
+                    // Anchor base prices (ES uses session anchor, BTC uses first bar)
+                    if (btcData.length > 0) {
+                        btcBasePrice = btcData[0].close;
+                    }
+                    if (esData.length > 0) {
+                        // Ensure ES base price is initialized (was missing)
+                        esBasePrice = esData[0].close;
+                        applyEsAnchor(esAnchorMode);
                     }
 
                     // Update % change display
@@ -1678,6 +2277,9 @@ class LiveDashboardServer:
                     if (msg.correlation) {
                         updateCorrelationDisplay(msg.correlation);
                     }
+
+                    // Register crosshair sync NOW that data is loaded
+                    registerCrosshairSync();
                 }
                 else if (msg.type === 'bar') {
                     // Completed bar - add to immutable array
@@ -1685,14 +2287,14 @@ class LiveDashboardServer:
                     if (msg.symbol === 'ES') {
                         esData.push(bar);
                         if (esData.length > 1440) esData.shift();
-                        esRtSeries.setData(esData);  // Reset data to ensure clean state
+                        try { esRtSeries.setData(esData); } catch(e) {}  // Reset data to ensure clean state
                         updatePrice(document.getElementById('es-price'), bar.close, lastEsPrice);
                         lastEsPrice = bar.close;
                         currentEsBar = null;  // Reset current bar tracking
                     } else if (msg.symbol === 'BTC') {
                         btcData.push(bar);
                         if (btcData.length > 1440) btcData.shift();
-                        btcRtSeries.setData(btcData);  // Reset data to ensure clean state
+                        try { btcRtSeries.setData(btcData); } catch(e) {}  // Reset data to ensure clean state
                         updatePrice(document.getElementById('btc-price'), bar.close, lastBtcPrice);
                         lastBtcPrice = bar.close;
                         currentBtcBar = null;  // Reset current bar tracking
@@ -1736,13 +2338,16 @@ class LiveDashboardServer:
                                 currentBtcBar.high = Math.max(currentBtcBar.high, price);
                                 currentBtcBar.low = Math.min(currentBtcBar.low, price);
                                 currentBtcBar.close = price;
-                            }
-                            btcRtSeries.update(currentBtcBar);
-                            updateHourlyBar('BTC', price);
-                            updateOverlayTick('BTC', price);  // Update overlay chart
-                        } else if (symbol === 'ES') {
+                        }
+                        throttledChartOp('batch-btc', 30, () => { btcRtSeries.update(currentBtcBar); });
+                        updateHourlyBar('BTC', price);
+                        updateOverlayTick('BTC', price);  // Update overlay chart
+                    } else if (symbol === 'ES') {
                             updatePrice(document.getElementById('es-price'), price, lastEsPrice);
                             lastEsPrice = price;
+                            if (esBasePrice == null && esData.length > 0) {
+                                esBasePrice = esData[0].close;
+                            }
 
                             if (!currentEsBar || currentEsBar.time !== now) {
                                 const lastComplete = esData.length > 0 ? esData[esData.length - 1] : null;
@@ -1756,10 +2361,10 @@ class LiveDashboardServer:
                                 currentEsBar.low = Math.min(currentEsBar.low, price);
                                 currentEsBar.close = price;
                             }
-                            esRtSeries.update(currentEsBar);
-                            updateHourlyBar('ES', price);
-                            updateOverlayTick('ES', price);  // Update overlay chart
-                        }
+                        throttledChartOp('batch-es', 30, () => { esRtSeries.update(currentEsBar); });
+                        updateHourlyBar('ES', price);
+                        updateOverlayTick('ES', price);  // Update overlay chart
+                    }
                     }
                     updatePctChange();
                 }
@@ -1793,12 +2398,15 @@ class LiveDashboardServer:
                             currentBtcBar.low = Math.min(currentBtcBar.low, msg.price);
                             currentBtcBar.close = msg.price;
                         }
-                        btcRtSeries.update(currentBtcBar);
+                        throttledChartOp('rt-btc', 30, () => { btcRtSeries.update(currentBtcBar); });
                         updateHourlyBar('BTC', msg.price);
                         updateOverlayTick('BTC', msg.price);  // Update overlay chart
                     } else if (msg.symbol === 'ES') {
                         updatePrice(document.getElementById('es-price'), msg.price, lastEsPrice);
                         lastEsPrice = msg.price;
+                        if (esBasePrice == null && esData.length > 0) {
+                            esBasePrice = esData[0].close;
+                        }
 
                         if (!currentEsBar || currentEsBar.time !== now) {
                             const lastComplete = esData.length > 0 ? esData[esData.length - 1] : null;
@@ -1812,7 +2420,7 @@ class LiveDashboardServer:
                             currentEsBar.low = Math.min(currentEsBar.low, msg.price);
                             currentEsBar.close = msg.price;
                         }
-                        esRtSeries.update(currentEsBar);
+                        throttledChartOp('rt-es', 30, () => { esRtSeries.update(currentEsBar); });
                         updateHourlyBar('ES', msg.price);
                         updateOverlayTick('ES', msg.price);  // Update overlay chart
                     }
