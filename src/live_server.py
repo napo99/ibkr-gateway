@@ -2480,8 +2480,8 @@ class LiveDashboardServer:
         print(f"[OK] Generated live dashboard")
 
     def _generate_micro_html(self):
-        """Generate a slim microstructure-focused dashboard (hide historical panes)."""
-        # Reuse the main HTML and hide historical sections when loaded.
+        """Generate a slim microstructure-focused dashboard (remove historical panes)."""
+        # Reuse the main HTML and strip historical sections after load.
         html = '''<!DOCTYPE html>
 <html>
 <head>
@@ -2492,17 +2492,23 @@ class LiveDashboardServer:
 <body>
     <div id="micro-root">Loading micro view...</div>
     <script>
-        // Load the main dashboard HTML, then hide historical panes.
+        // Load the main dashboard HTML, then remove historical panes.
         fetch('/').then(r => r.text()).then(html => {
             document.open();
             document.write(html);
             document.close();
-            // Hide second charts-container row (historical) if present.
-            const grids = document.querySelectorAll('.charts-container');
-            grids.forEach((el, idx) => {
-                if (idx > 0) el.style.display = 'none';
+            // Remove historical chart wrappers
+            document.querySelectorAll('.chart-wrapper.historical').forEach(el => el.remove());
+            // Remove any section titles that reference Historical
+            document.querySelectorAll('.section-title').forEach(el => {
+                if (el.textContent && el.textContent.toLowerCase().includes('historical')) {
+                    el.remove();
+                }
             });
-            // Keep correlation overlay visible.
+            // Remove empty grids left behind
+            document.querySelectorAll('.charts-container').forEach(el => {
+                if (!el.querySelector('.chart-wrapper')) el.remove();
+            });
         });
     </script>
 </body>
