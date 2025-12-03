@@ -318,6 +318,76 @@ class LiveDashboardServer:
         except Exception as e:
             print(f"[BTC] Historical error: {e}")
 
+        # Heal any gaps since the last bar (startup/reconnect)
+        await self._heal_gaps()
+
+    async def _heal_gaps(self):
+        """Fetch missing bars from last known timestamp to now for BTC and ES."""
+        try:
+            now_ts = datetime.now(timezone.utc)
+
+            # BTC gaps (1m)
+            if self.btc_backfill:
+                last_btc_ts = datetime.fromtimestamp(self.btc_backfill[-1]['time'], tz=timezone.utc)
+                missing_min = int((now_ts - last_btc_ts).total_seconds() // 60)
+                if missing_min > 1:
+                    limit = min(missing_min, 1440)
+                    print(f"[GAP][BTC] Missing {missing_min} min; fetching {limit} bars")
+                    btc_df = await self.binance.fetch_historical('1m', limit)
+                    btc_df = self._clean_dataframe(btc_df)
+                    if not btc_df.empty:
+                        btc_df = btc_df[btc_df['timestamp'] > last_btc_ts]
+                        new_bars = [
+                            {'time': int(row['timestamp'].timestamp()),
+                             'open': row['open'], 'high': row['high'],
+                             'low': row['low'], 'close': row['close'],
+                             'volume': row['volume']}
+                            for _, row in btc_df.iterrows()
+                        ]
+                        if new_bars:
+                            self.btc_backfill.extend(new_bars)
+                            for bar in new_bars:
+                                aligned_ts = self._align_timestamp(datetime.fromtimestamp(bar['time'], tz=timezone.utc))
+                                self.btc_bar_buffer.append({
+                                    'timestamp': aligned_ts,
+                                    'open': bar['open'], 'high': bar['high'],
+                                    'low': bar['low'], 'close': bar['close'],
+                                    'volume': bar['volume']
+                                })
+                            print(f"[GAP][BTC] Filled {len(new_bars)} missing bars")
+
+            # ES gaps (1m)
+            if self.es_backfill:
+                last_es_ts = datetime.fromtimestamp(self.es_backfill[-1]['time'], tz=timezone.utc)
+                missing_min = int((now_ts - last_es_ts).total_seconds() // 60)
+                if missing_min > 1:
+                    print(f"[GAP][ES] Missing {missing_min} min; fetching via IBKR")
+                    es_df = self.ibkr.fetch_missing(last_es_ts, '1 min')
+                    es_df = self._clean_dataframe(es_df)
+                    if not es_df.empty:
+                        es_df = es_df[es_df['timestamp'] > last_es_ts]
+                        new_bars = [
+                            {'time': int(self._align_timestamp(row['timestamp']).timestamp()),
+                             'open': row['open'], 'high': row['high'],
+                             'low': row['low'], 'close': row['close'],
+                             'volume': row['volume']}
+                            for _, row in es_df.iterrows()
+                        ]
+                        if new_bars:
+                            self.es_backfill.extend(new_bars)
+                            for bar in new_bars:
+                                aligned_ts = datetime.fromtimestamp(bar['time'], tz=timezone.utc)
+                                self.es_bar_buffer.append({
+                                    'timestamp': aligned_ts,
+                                    'open': bar['open'], 'high': bar['high'],
+                                    'low': bar['low'], 'close': bar['close'],
+                                    'volume': bar['volume']
+                                })
+                            print(f"[GAP][ES] Filled {len(new_bars)} missing bars")
+
+        except Exception as e:
+            print(f"[GAP] Error healing gaps: {e}")
+
         try:
             es_hist = self.ibkr.fetch_historical('7 D', '1 hour')
             es_hist = self._clean_dataframe(es_hist)

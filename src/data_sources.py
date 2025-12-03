@@ -240,6 +240,43 @@ class IBKRClient:
             for b in bars
         ])
 
+    def fetch_missing(self, since: datetime, bar_size: str = '1 min') -> pd.DataFrame:
+        """Fetch bars from a given timestamp up to now."""
+        if not self._contract:
+            return pd.DataFrame()
+        now = datetime.now(timezone.utc)
+        if since is None or since >= now:
+            return pd.DataFrame()
+
+        delta = now - since
+        minutes = int(delta.total_seconds() // 60)
+        if minutes <= 0:
+            return pd.DataFrame()
+
+        # IBKR durationStr: cap to 30 days to avoid huge requests
+        days = max(1, min(30, (minutes // (24 * 60)) + 1))
+        duration = f"{days} D"
+
+        bars = self.ib.reqHistoricalData(
+            self._contract,
+            endDateTime='',
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow='TRADES',
+            useRTH=False,
+            formatDate=1
+        )
+        if not bars:
+            return pd.DataFrame()
+
+        df = pd.DataFrame([
+            {'timestamp': b.date.replace(tzinfo=timezone.utc) if b.date.tzinfo is None else b.date,
+             'open': b.open, 'high': b.high, 'low': b.low,
+             'close': b.close, 'volume': b.volume}
+            for b in bars
+        ])
+        return df[df['timestamp'] > since]
+
     def _on_realtime_bar(self, bars, has_new_bar):
         """Callback for real-time 5-sec bars - aggregate to 1-min"""
         if not has_new_bar:
